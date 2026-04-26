@@ -1178,6 +1178,13 @@ def main(
     poly_data_dir: str = typer.Option("", "--poly-data-dir", help="Path to poly dataset directory for Dockerfile extraction", rich_help_panel="Advanced"),
     auto_pull: bool = typer.Option(True, "--auto-pull/--no-auto-pull", help="Automatically pull missing Docker images", rich_help_panel="Advanced"),
     multiswe_format: bool = typer.Option(False, "--multiswe-format", help="Use Multi-SWE-bench data format with org/repo/number fields", rich_help_panel="Advanced"),
+    step_response_timeout: float | None = typer.Option(
+        None,
+        "--step-response-timeout",
+        help="Override agent step_response_timeout (seconds) for a single LLM step; 0 disables. "
+        "If unset, use the value from the YAML config under agent:.",
+        rich_help_panel="Advanced",
+    ),
 ) -> None:
     # fmt: on
     output_path = Path(output)
@@ -1260,6 +1267,8 @@ def main(
         config.setdefault("model", {})["model_name"] = model
     if model_class is not None:
         config.setdefault("model", {})["model_class"] = model_class
+    if step_response_timeout is not None:
+        config.setdefault("agent", {})["step_response_timeout"] = float(step_response_timeout)
 
     progress_manager = RunBatchProgressManager(len(instances), output_path / f"exit_statuses_{time.time()}.yaml")
 

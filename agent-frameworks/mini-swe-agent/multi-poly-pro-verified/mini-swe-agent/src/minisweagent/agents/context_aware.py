@@ -1,5 +1,6 @@
 """Context-aware agent that prompts for context before patch submission."""
 
+import concurrent.futures
 import json
 import re
 from pathlib import Path
@@ -60,10 +61,16 @@ class ContextAwareAgentConfig(BaseModel):
     step_limit: int = 0
     cost_limit: float = 3.0
     save_context_to_file: bool = True
+    step_response_timeout: float = 0.0
+    """Seconds for one LM step; 0 disables per-step timeout."""
 
 
 class ContextRequested(Exception):
     """Raised when agent wants to submit but needs to provide context first."""
+
+
+class StepResponseTimeout(Exception):
+    """Raised when a single agent step exceeds response timeout."""
 
 
 class ContextAwareAgent(DefaultAgent):
@@ -213,17 +220,42 @@ class ContextAwareAgent(DefaultAgent):
 
         while True:
             try:
-                self.step()
+                self._step_with_timeout_guard()
             except ContextRequested as e:
                 self.add_message("user", str(e))
             except Exception as e:
                 if type(e).__name__ in ["NonTerminatingException", "FormatError", "ExecutionTimeoutError"]:
                     self.add_message("user", str(e))
-                elif type(e).__name__ in ["Submitted", "LimitsExceeded", "TerminatingException"]:
+                elif type(e).__name__ in [
+                    "Submitted",
+                    "LimitsExceeded",
+                    "TerminatingException",
+                    "StepResponseTimeout",
+                ]:
                     self.add_message("user", str(e))
                     return type(e).__name__, str(e)
                 else:
                     raise
+
+    def _step_with_timeout_guard(self) -> dict:
+        """Execute one step with optional timeout guard for model responses."""
+        timeout_s = float(getattr(self.config, "step_response_timeout", 0.0) or 0.0)
+        if timeout_s <= 0:
+            return self.step()
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(self.step)
+        try:
+            return future.result(timeout=timeout_s)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            timeout_message = (
+                f"Step response timed out after {timeout_s:.1f}s. "
+                "Terminating this instance and saving trajectory."
+            )
+            raise StepResponseTimeout(timeout_message)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def _save_context(self):
         """Save extracted context to a JSON file alongside the trajectory."""
