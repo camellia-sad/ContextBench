@@ -36,7 +36,7 @@ agent:
     2. Provide exactly ONE bash command to execute
 
     ## Important Boundaries
-    - MODIFY: Regular source code files in /testbed (this is the working directory for all your subsequent commands)
+    - MODIFY: Regular source code files in the current working directory (this is the working directory for all your subsequent commands)
     - DO NOT MODIFY: Tests, project configuration files (e.g., build configs, lockfiles, CI configs), or environment setup unless the PR description explicitly requires it.
 
     ## Recommended Workflow
@@ -100,26 +100,37 @@ agent:
     Your bash command MUST print the declared file line range(s) to stdout (the terminal output we see),
     so we can map `<EXPLORE_CONTEXT>` entries to the observed `<output>` content.
 
+    **STRICT ENFORCEMENT FOR READING COMMANDS:**
+    - If your command prints source code (e.g., `cat`, `sed -n`, `nl ... | sed`, `head`, `tail`, `awk` on source files),
+      you MUST include `<EXPLORE_CONTEXT>` in the same response.
+    - If `<EXPLORE_CONTEXT>` is missing or malformed for a reading command, your response is considered invalid.
+    - In that case, DO NOT continue with a new command. Re-emit a corrected response for the SAME intended command,
+      with a valid `<EXPLORE_CONTEXT>` block.
+    - Before finalizing each response, perform a self-check:
+      1) Is this a code-reading command?
+      2) If yes, did I include `<EXPLORE_CONTEXT>` with absolute file paths and valid ranges?
+      3) Does the command output exactly match those declared ranges?
+
     **Good examples:**
     <EXPLORE_CONTEXT>
-    File: /testbed/src/foo.py
+    File: /testbed/src/foo.ext
     Lines: 10-40
     </EXPLORE_CONTEXT>
 
     ```bash
-    nl -ba /testbed/src/foo.py | sed -n '10,40p'
+    nl -ba /testbed/src/foo.ext | sed -n '10,40p'
     ```
 
     <EXPLORE_CONTEXT>
-    File: /testbed/src/a.py
+    File: /testbed/src/a.ext
     Lines: 1-80
 
-    File: /testbed/src/b.py
+    File: /testbed/src/b.ext
     Lines: 120-160
     </EXPLORE_CONTEXT>
 
     ```bash
-    (nl -ba /testbed/src/a.py | sed -n '1,80p' && echo '---' && nl -ba /testbed/src/b.py | sed -n '120,160p')
+    (nl -ba /testbed/src/a.ext | sed -n '1,80p' && echo '---' && nl -ba /testbed/src/b.ext | sed -n '120,160p')
     ```
 
     ## Environment Details
@@ -127,6 +138,12 @@ agent:
     - Always use non-interactive flags (-y, -f) for commands
     - Avoid interactive tools like vi, nano, or any that require user input
     - If a command isn't available, you can install it
+
+    ## Multi-SWE-bench Specific Notes
+    - You are working in a Multi-SWE-bench environment with multi-language repositories
+    - The project may be in a subdirectory (e.g., /home/repo-name/)
+    - Git repository is typically located in the project subdirectory
+    - When working with Git operations, ensure you're in the correct repository directory
 
     ## Useful Command Examples
 
@@ -140,22 +157,22 @@ agent:
     ### Edit files with sed:
     ```bash
     # Replace all occurrences
-    sed -i 's/old_string/new_string/g' filename.py
+    sed -i 's/old_string/new_string/g' filename.ext
 
     # Replace only first occurrence
-    sed -i 's/old_string/new_string/' filename.py
+    sed -i 's/old_string/new_string/' filename.ext
 
     # Replace first occurrence on line 1
-    sed -i '1s/old_string/new_string/' filename.py
+    sed -i '1s/old_string/new_string/' filename.ext
 
     # Replace all occurrences in lines 1-10
-    sed -i '1,10s/old_string/new_string/g' filename.py
+    sed -i '1,10s/old_string/new_string/g' filename.ext
     ```
 
     ### View file content:
     ```bash
     # View specific lines with numbers
-    nl -ba filename.py | sed -n '10,20p'
+    nl -ba filename.ext | sed -n '10,20p'
     ```
 
     ## Submission
@@ -163,7 +180,7 @@ agent:
     issue exactly the following command:
 
     ```bash
-    echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached
+    echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && (git status >/dev/null 2>&1 && git add -A && git diff --cached) || (cd */. 2>/dev/null && git add -A && git diff --cached) || (find . -name '.git' -type d -exec sh -c 'cd "$(dirname "{}")" && git add -A && git diff --cached' \; 2>/dev/null | head -n 1000) || (echo "Error: No git repository found")
     ```
 
     This command will submit your work.
@@ -212,10 +229,14 @@ agent:
     </PATCH_CONTEXT>
 
     ```bash
-    echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached
+    echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && (git status >/dev/null 2>&1 && git add -A && git diff --cached) || (cd */. 2>/dev/null && git add -A && git diff --cached) || (find . -name '.git' -type d -exec sh -c 'cd "$(dirname "{}")" && git add -A && git diff --cached' \; 2>/dev/null | head -n 1000) || (echo "Error: No git repository found")
     ```
     
     **CRITICAL:** Provide ONLY file paths and line ranges (no code snippets, no explanations) within <PATCH_CONTEXT> tags.
+    **CRITICAL:** If `<PATCH_CONTEXT>` is missing, malformed, or outside this exact tag, submission will proceed without context.
+    **CRITICAL:** Your response to this request MUST contain `<PATCH_CONTEXT>...</PATCH_CONTEXT>` and the submission bash command
+    in the SAME response. Never send the submission command alone.
+    **CRITICAL:** `<PATCH_CONTEXT>` MUST appear before the bash block.
     </context_request>
   context_confirmation_template: |
     <context_received>
@@ -285,32 +306,27 @@ agent:
     </output_tail>
     {%- endif %}
     Please try another command and make sure to avoid those requiring interactive input.
-  step_limit: 1050
-  cost_limit: 20.0
+  step_limit: 300
+  cost_limit: 5.0
   save_context_to_file: true
 
 environment:
-  cwd: "/testbed"
-  timeout: 60
-  pull_timeout: 600  # Docker 镜像拉取/容器启动超时（秒）
+  timeout: 180  # 单个命令超时（秒） - 增加到10分钟以处理大型仓库的git操作
+  pull_timeout: 3600  # Docker 镜像拉取/容器启动超时（秒）
   env:
     PAGER: cat
     MANPAGER: cat
     LESS: -R
-    PIP_INDEX_URL: "https://pypi.tuna.tsinghua.edu.cn/simple"
-    PIP_TRUSTED_HOST: "pypi.tuna.tsinghua.edu.cn"
-    PIP_DEFAULT_TIMEOUT: "120"
-    PIP_RETRIES: "10"
     PIP_PROGRESS_BAR: 'off'
     TQDM_DISABLE: '1'
   environment_class: docker
 
 model:
   model_class: litellm
-  model_name: "hosted_vllm/Qwen/Qwen3-Coder-Next"
+  model_name: "hosted_vllm/Qwen/Qwen2.5-Coder-32B-Instruct"
   cost_tracking: ignore_errors
   model_kwargs:
-    api_base: "http://172.17.0.2:8000/v1"
+    api_base: "http://127.0.0.1:8000/v1"
     api_key: "EMPTY"
     request_timeout : 3600
     timeout : 3600
