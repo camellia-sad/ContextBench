@@ -31,6 +31,9 @@ Usage:
 
     # Dry run (list tasks only)
     python -m contextbench.run --agent miniswe --bench Verified --dry-run
+
+    # miniswe: parallel workers and per-step LM timeout (see swebench_context_aware --help)
+    python -m contextbench.run --agent miniswe --bench Pro --workers 4 --miniswe-step-response-timeout 600
 """
 
 from __future__ import annotations
@@ -499,6 +502,13 @@ def run_miniswe(task: Dict[str, Any], output_dir: Path, timeout: int = 1800) -> 
         "--filter", f"^{filter_id}$",
         "--output", str(out_subdir),
     ]
+    mopts = task.get("_miniswe") or {}
+    w = int(mopts.get("workers", 1) or 1)
+    if w > 0:
+        cmd.extend(["-w", str(w)])
+    srt = mopts.get("step_response_timeout")
+    if srt is not None:
+        cmd.extend(["--step-response-timeout", str(float(srt))])
     try:
         result = _run_subprocess(cmd, cwd=str(miniswe_src), env=env, timeout=timeout, debug=_DEBUG)
         if result.returncode == 0:
@@ -849,6 +859,22 @@ def main() -> int:
         default=None,
         help="OpenHands agent class (or set OPENHANDS_AGENT)",
     )
+    # MiniSWE-agent (swebench_context_aware) — forwarded to miniswe subprocess only
+    ap.add_argument(
+        "--miniswe-step-response-timeout",
+        type=float,
+        default=None,
+        help="For --agent miniswe: passed as --step-response-timeout to swebench_context_aware "
+        "(seconds per LM step; 0 disables). Omit to use YAML only.",
+    )
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        metavar="N",
+        dest="miniswe_workers",
+        help="For --agent miniswe: parallel instances (-w) for swebench_context_aware. Ignored for other agents.",
+    )
     args = ap.parse_args()
     global _DEBUG
     _DEBUG = bool(args.debug)
@@ -923,6 +949,12 @@ def main() -> int:
     success = 0
     failed = 0
     for i, task in enumerate(tasks):
+        task = dict(task)
+        if args.agent == "miniswe":
+            task["_miniswe"] = {
+                "workers": int(args.miniswe_workers or 1),
+                "step_response_timeout": args.miniswe_step_response_timeout,
+            }
         inst = task.get("instance_id") or task.get("original_inst_id", "?")
         print(f"[{i+1}/{len(tasks)}] {args.agent} | {task['bench']} | {inst} ...", flush=True)
         if args.rerun:
