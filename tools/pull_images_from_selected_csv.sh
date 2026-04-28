@@ -5,6 +5,7 @@
 # Default targets:
 # - Verified: docker.io/swebench/sweb.eval.x86_64.<iid_with__mapped_to_1776_>:latest
 # - Poly:     ghcr.io/timesler/swe-polybench.eval.x86_64.<iid>:latest
+#   With MSWEA_DOCKER_IMAGE_REGISTRY=ghcr.nju.edu.cn: ghcr.nju.edu.cn/timesler/...
 #
 # Notes:
 # - Pro/Multi require additional metadata (repo/pr_number) that is not present in
@@ -87,6 +88,20 @@ def apply_registry_prefix(uri: str) -> str:
             return uri
     return f"{prefix}/{rest}"
 
+
+def apply_registry_mirror_prefix(full_image_uri: str) -> str:
+    """Same as minisweagent: ghcr.io/org:tag -> <mirror>/org:tag."""
+    if not full_image_uri:
+        return full_image_uri
+    prefix = normalize_registry_prefix(os.environ.get("MSWEA_DOCKER_IMAGE_REGISTRY", ""))
+    if not prefix:
+        return full_image_uri
+    if full_image_uri == prefix or full_image_uri.startswith(prefix + "/"):
+        return full_image_uri
+    if full_image_uri.startswith("ghcr.io/"):
+        return f"{prefix}/{full_image_uri[len('ghcr.io/') :]}"
+    return full_image_uri
+
 images = set()
 
 def add_image(img: str):
@@ -109,8 +124,9 @@ with csv_path.open("r", encoding="utf-8") as f:
             img = f"docker.io/swebench/sweb.eval.x86_64.{id_docker_compatible}:latest"
             add_image(img)
         elif bench == "Poly":
-            # mirror naming logic in get_swebench_docker_image_name() when dataset_name contains "PolyBench"
-            img = f"ghcr.io/timesler/swe-polybench.eval.x86_64.{iid}:latest"
+            img = apply_registry_mirror_prefix(
+                f"ghcr.io/timesler/swe-polybench.eval.x86_64.{iid}:latest"
+            )
             add_image(img)
         else:
             # Pro/Multi not solvable from this CSV alone (repo/pr_number missing)

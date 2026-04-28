@@ -170,7 +170,7 @@ def print_rerun_instances_hint(
         f"--task-csv {shlex.quote(csv_disp)} --bench {shlex.quote(bench)} "
         f"--timeout 3600 --miniswe-step-response-timeout 300 "
         f"-o output_vllm/select_500_deepseek_coder_33b --instances {shlex.quote(joined)}"
-        f"--workers 12 --rerun "
+        f" --workers 12 --rerun "
     )
     print(f"  {ex}")
 

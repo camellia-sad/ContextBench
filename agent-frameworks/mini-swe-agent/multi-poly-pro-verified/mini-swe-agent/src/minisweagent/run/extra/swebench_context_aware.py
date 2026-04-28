@@ -3,14 +3,21 @@
 
 import concurrent.futures
 import json
+import os
 import random
 import re
 import subprocess
 import threading
 import time
 import traceback
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
+
+try:
+    import fcntl
+except ImportError:  # non-Unix
+    fcntl = None
 
 import typer
 import yaml
@@ -24,6 +31,10 @@ from minisweagent import Environment, global_config_dir
 from minisweagent.agents.context_aware import ContextAwareAgent
 from minisweagent.config import builtin_config_dir, get_config_path
 from minisweagent.models import get_model
+from minisweagent.run.extra.docker_image_registry import (
+    apply_docker_image_registry_prefix,
+    apply_registry_mirror_prefix,
+)
 from minisweagent.run.extra.swebench import DATASET_MAPPING, get_sb_environment
 from minisweagent.run.extra.utils.batch_progress import RunBatchProgressManager
 from minisweagent.run.utils.save import save_traj
@@ -45,6 +56,22 @@ More information: [bold green]https://mini-swe-agent.com/latest/usage/swebench/[
 app = typer.Typer(rich_markup_mode="rich", add_completion=False)
 _OUTPUT_FILE_LOCK = threading.Lock()
 DEFAULT_OUTPUT = global_config_dir / "last_swebench_context_aware_run.traj.json"
+
+
+@contextmanager
+def _preds_file_flock(preds_path: Path):
+    """Serialize preds.json read/modify/write across processes (e.g. many ContextBench workers)."""
+    if fcntl is None:
+        yield
+        return
+    lock_path = preds_path.parent / f".{preds_path.name}.flock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+b") as lockf:
+        fcntl.flock(lockf, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lockf, fcntl.LOCK_UN)
 
 
 class BenchmarkType(str, Enum):
@@ -218,23 +245,31 @@ class PolyBenchStrategy(DockerStrategy):
     
     def get_docker_config(self, instance: dict, auto_pull: bool = True) -> dict:
         instance_id = instance.get("instance_id", "")
-        
-        # Try Priority 1: PolyBench pre-built image
-        polybench_image = f"ghcr.io/timesler/swe-polybench.eval.x86_64.{instance_id}:latest"
-        
-        if auto_pull and DockerConfigExtractor.pull_image_if_needed(polybench_image, pull_timeout=600):
-            cwd = _detect_docker_image_workdir(polybench_image) or "/testbed"
-            return {
-                "base_image": polybench_image,
-                "dockerfile_content": None,
-                "source": "polybench",
-                "cwd": cwd,
-                "timeout": 120,
-                "pull_timeout": 600,
-                "run_args": ["--rm"],
-            }
-        
-        # Try Priority 2: Extract Dockerfile from poly data
+
+        # Priority 1: Poly pre-built. Local first (exact names, then any tag for this instance), then pull.
+        base_ghcr = f"ghcr.io/timesler/swe-polybench.eval.x86_64.{instance_id}:latest"
+        mirrored = apply_registry_mirror_prefix(base_ghcr)
+        image_candidates: list[str] = []
+        for u in (mirrored, base_ghcr):
+            if u and u not in image_candidates:
+                image_candidates.append(u)
+        if auto_pull:
+            resolved = DockerConfigExtractor.resolve_polybench_prebuilt_image(
+                instance_id, pull_timeout=600
+            )
+            if resolved:
+                cwd = _detect_docker_image_workdir(resolved) or "/testbed"
+                return {
+                    "base_image": resolved,
+                    "dockerfile_content": None,
+                    "source": "polybench",
+                    "cwd": cwd,
+                    "timeout": 120,
+                    "pull_timeout": 600,
+                    "run_args": ["--rm"],
+                }
+
+        # Priority 2: Extract Dockerfile from poly data
         if self.poly_data_dir and self.poly_data_dir.exists():
             dockerfile_content = DockerConfigExtractor.extract_dockerfile_from_poly_data(
                 self.poly_data_dir, instance_id
@@ -249,10 +284,12 @@ class PolyBenchStrategy(DockerStrategy):
                     "pull_timeout": 600,
                     "run_args": ["--rm"],
                 }
-        
+
         raise RuntimeError(
             f"No Docker configuration found for PolyBench instance {instance_id}. "
-            f"Neither pre-built image nor Dockerfile from poly data available."
+            f"Tried pre-built ref(s) / local scan for: {image_candidates}. "
+            f"Pull or import (e.g. `docker pull <uri>`), align DOCKER_HOST with your CLI, "
+            f"or pass --poly-data-dir. For NJU mirror: export MSWEA_DOCKER_IMAGE_REGISTRY=ghcr.nju.edu.cn"
         )
     
     def get_environment_config(self, instance: dict, docker_config: dict) -> dict:
@@ -394,7 +431,8 @@ class DockerConfigExtractor:
         if not pr_number or not pr_number.isdigit():
             return ""
             
-        return f"mswebench/{org_clean}_m_{repo_clean}:pr-{pr_number}"
+        image = f"mswebench/{org_clean}_m_{repo_clean}:pr-{pr_number}"
+        return apply_docker_image_registry_prefix(image)
 
     @staticmethod
     def pull_image_if_needed(image_uri: str, pull_timeout: int = 300) -> bool:
@@ -412,7 +450,9 @@ class DockerConfigExtractor:
             
         try:
             import docker
-            client = docker.from_env(timeout=pull_timeout)
+            from minisweagent.run.extra.docker_client import docker_from_env
+
+            client = docker_from_env(timeout=pull_timeout)
             
             # PRIORITY 1: Check if image exists locally (fastest, no network needed)
             try:
@@ -441,6 +481,81 @@ class DockerConfigExtractor:
         except Exception as e:
             logger.error(f"Docker client error for {image_uri}: {e}")
             return False
+
+    @staticmethod
+    def _find_local_polybench_tag_by_instance_id(client, instance_id: str) -> Optional[str]:
+        """If any local image is tagged for this Poly instance (any registry host), return that ref."""
+        if not instance_id:
+            return None
+        needle = f"swe-polybench.eval.x86_64.{instance_id}"
+        try:
+            for im in client.images.list():
+                for tag in im.tags or []:
+                    if needle not in tag:
+                        continue
+                    if tag.endswith(":latest") or (":" in tag and tag.rsplit(":", 1)[-1] == "latest"):
+                        return tag
+        except Exception as e:
+            logger.warning(f"Local PolyBench image list scan failed: {e}")
+        return None
+
+    @staticmethod
+    def resolve_polybench_prebuilt_image(instance_id: str, pull_timeout: int = 600) -> Optional[str]:
+        """Poly pre-built: local only first (exact + tag scan), then pull.
+
+        *Local checks* try both mirror name (e.g. ghcr.nju.edu.cn/...) and ghcr.io/... if different.
+        *Pull* is Poly-only: if ``MSWEA_DOCKER_IMAGE_REGISTRY`` rewrites ghcr (e.g. to ghcr.nju.edu.cn),
+        only that mirror URL is pulled — not public ghcr.io. If unset, only ghcr.io is pulled.
+        Other benches (Verified/Pro/Multi) use ``apply_docker_image_registry_prefix`` + their own hosts.
+        """
+        if not instance_id:
+            return None
+        base_ghcr = f"ghcr.io/timesler/swe-polybench.eval.x86_64.{instance_id}:latest"
+        mirrored = apply_registry_mirror_prefix(base_ghcr)
+        local_order: List[str] = []
+        for u in (mirrored, base_ghcr):
+            if u and u not in local_order:
+                local_order.append(u)
+        if mirrored != base_ghcr:
+            pull_uris: List[str] = [mirrored]
+        else:
+            pull_uris = [base_ghcr]
+        try:
+            import docker
+            from minisweagent.run.extra.docker_client import docker_from_env
+
+            client = docker_from_env(timeout=pull_timeout)
+        except Exception as e:
+            logger.error(
+                "Cannot create Docker client — local images cannot be used and pull will not run: %s\n"
+                "  This is not 'missing image': the engine API (e.g. unversioned GET /version) was denied or unreachable.\n"
+                "  If `docker` in your shell works, use the same DOCKER_HOST/TLS, or set DOCKER_API_VERSION to match the server.\n"
+                "  403 with opa-docker-authz: some policies only allow /v1.xx/... and block the legacy /version probe (docker-py's default).",
+                e,
+            )
+            return None
+        for uri in local_order:
+            try:
+                client.images.get(uri)
+                logger.info(f"✓ Using locally cached image: {uri}")
+                return uri
+            except docker.errors.ImageNotFound:
+                continue
+            except Exception as e:
+                logger.warning(f"Error checking local image {uri}: {e}")
+        found = DockerConfigExtractor._find_local_polybench_tag_by_instance_id(client, instance_id)
+        if found:
+            logger.info(f"✓ Using locally cached image (name scan): {found}")
+            return found
+        for uri in pull_uris:
+            try:
+                logger.info(f"⬇️  Pulling Docker image: {uri} (timeout: {pull_timeout}s)")
+                client.images.pull(uri)
+                logger.info(f"✓ Successfully pulled: {uri}")
+                return uri
+            except Exception as e:
+                logger.error(f"✗ Failed to pull {uri}: {e}")
+        return None
 
     @staticmethod
     def extract_dockerfile_from_patch(model_patch: str) -> Optional[str]:
@@ -723,9 +838,9 @@ def _detect_docker_image_workdir(image_name: str) -> Optional[str]:
         # Docker returns empty string if WORKDIR wasn't set, defaulting to "/"
         if not workdir or workdir == "/":
             # Multi-SWE-bench pattern: check /home/{repo} first
-            if image_name.startswith("mswebench/"):
+            if image_name.startswith("mswebench/") or "/mswebench/" in image_name:
                 # Extract repo name from mswebench/{org}_m_{repo}:tag pattern
-                repo_part = image_name.split("/")[1].split(":")[0]  # get org_m_repo part
+                repo_part = image_name.rsplit("/", 1)[-1].split(":")[0]  # get org_m_repo part
                 if "_m_" in repo_part:
                     repo_name = repo_part.split("_m_", 1)[1].replace("_", "-")
                     potential_dirs = [f"/home/{repo_name}", "/home", "/testbed", "/app", "/workspace"]
@@ -877,16 +992,26 @@ class ProgressTrackingContextAwareAgent(ContextAwareAgent):
 
 def update_preds_file(output_path: Path, instance_id: str, model_name: str, result: str):
     """Update the output JSON file with results from a single instance."""
-    with _OUTPUT_FILE_LOCK:
-        output_data = {}
-        if output_path.exists():
-            output_data = json.loads(output_path.read_text())
-        output_data[instance_id] = {
-            "model_name_or_path": model_name,
-            "instance_id": instance_id,
-            "model_patch": result,
-        }
-        output_path.write_text(json.dumps(output_data, indent=2))
+    try:
+        with _OUTPUT_FILE_LOCK:
+            with _preds_file_flock(output_path):
+                output_data: dict = {}
+                if output_path.exists() and output_path.stat().st_size > 0:
+                    try:
+                        output_data = json.loads(output_path.read_text())
+                    except (json.JSONDecodeError, OSError) as e:
+                        logger.warning(f"Corrupt or unreadable {output_path}, resetting: {e}")
+                        output_data = {}
+                if not isinstance(output_data, dict):
+                    output_data = {}
+                output_data[instance_id] = {
+                    "model_name_or_path": model_name,
+                    "instance_id": instance_id,
+                    "model_patch": result,
+                }
+                output_path.write_text(json.dumps(output_data, indent=2))
+    except Exception as e:
+        logger.error(f"Failed to write {output_path} for {instance_id}: {e}", exc_info=True)
 
 
 def remove_from_preds_file(output_path: Path, instance_id: str):
@@ -894,10 +1019,11 @@ def remove_from_preds_file(output_path: Path, instance_id: str):
     if not output_path.exists():
         return
     with _OUTPUT_FILE_LOCK:
-        output_data = json.loads(output_path.read_text())
-        if instance_id in output_data:
-            del output_data[instance_id]
-            output_path.write_text(json.dumps(output_data, indent=2))
+        with _preds_file_flock(output_path):
+            output_data = json.loads(output_path.read_text())
+            if instance_id in output_data:
+                del output_data[instance_id]
+                output_path.write_text(json.dumps(output_data, indent=2))
 
 
 def process_instance(
@@ -957,19 +1083,33 @@ def process_instance(
         if extra_info is None:
             extra_info = {}
         extra_info["docker_config"] = docker_config
-        
-        save_traj(
-            agent,
-            instance_dir / f"{instance_id}.traj.json",
-            exit_status=exit_status,
-            result=result,
-            extra_info=extra_info,
-            instance_id=instance_id,
-            print_fct=logger.info,
-        )
+
+        try:
+            save_traj(
+                agent,
+                instance_dir / f"{instance_id}.traj.json",
+                exit_status=exit_status,
+                result=result,
+                extra_info=extra_info,
+                instance_id=instance_id,
+                print_fct=logger.info,
+            )
+        except Exception as save_err:
+            logger.error(f"save_traj failed for {instance_id}: {save_err}", exc_info=True)
         if agent:
-            logger.info(f"Context data for {instance_id}: {agent.get_context_data()}")
-        update_preds_file(output_dir / "preds.json", instance_id, model.config.model_name, result)
+            try:
+                logger.info(f"Context data for {instance_id}: {agent.get_context_data()}")
+            except Exception as ctx_err:
+                logger.debug(f"get_context_data for {instance_id}: {ctx_err}")
+        try:
+            update_preds_file(
+                output_dir / "preds.json",
+                instance_id,
+                model.config.model_name,
+                result,
+            )
+        except Exception as preds_err:
+            logger.error(f"update_preds_file failed for {instance_id}: {preds_err}", exc_info=True)
         progress_manager.on_instance_end(instance_id, exit_status)
         # Cleanup Docker environment
         if env is not None:
@@ -1257,6 +1397,14 @@ def main(
         logger.info(f"Skipping {len(existing_instances)} existing instances")
         instances = [instance for instance in instances if instance["instance_id"] not in existing_instances]
     logger.info(f"Running on {len(instances)} instances...")
+    if not instances:
+        logger.warning("No instances after filtering; preds.json will not be updated (nothing to run).")
+    else:
+        preds_path = output_path / "preds.json"
+        preds_path.parent.mkdir(parents=True, exist_ok=True)
+        if not preds_path.exists():
+            preds_path.write_text("{}\n")
+            logger.info(f"Initialized empty {preds_path} for this run.")
 
     config_path = get_config_path(config_spec)
     logger.info(f"Loading agent config from '{config_path}'")
@@ -1272,16 +1420,20 @@ def main(
 
     progress_manager = RunBatchProgressManager(len(instances), output_path / f"exit_statuses_{time.time()}.yaml")
 
-    def process_futures(futures: dict[concurrent.futures.Future, str]):
+    def process_futures(futures: dict[concurrent.futures.Future, str]) -> bool:
+        """Run futures; return True if all completed without error, False if any instance failed."""
+        any_failed = False
         for future in concurrent.futures.as_completed(futures):
             try:
                 future.result()
             except concurrent.futures.CancelledError:
                 pass
             except Exception as e:
+                any_failed = True
                 instance_id = futures[future]
                 logger.error(f"Error in future for instance {instance_id}: {e}", exc_info=True)
                 progress_manager.on_uncaught_exception(instance_id, e)
+        return not any_failed
 
     # Log the determined benchmark type
     logger.info(f"Using benchmark type: {determined_benchmark_type.value}")
@@ -1302,13 +1454,15 @@ def main(
                 for instance in instances
             }
             try:
-                process_futures(futures)
+                ok = process_futures(futures)
             except KeyboardInterrupt:
                 logger.info("Cancelling all pending jobs. Press ^C again to exit immediately.")
                 for future in futures:
                     if not future.running() and not future.done():
                         future.cancel()
-                process_futures(futures)
+                ok = process_futures(futures)
+            if not ok:
+                raise SystemExit(1)
 
 
 if __name__ == "__main__":

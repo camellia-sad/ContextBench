@@ -15,6 +15,9 @@
 # - For your private mirror domain, set:
 #     export MSWEA_DOCKER_IMAGE_REGISTRY="fczi514j9ggm7b.xuanyuan.run"
 #   so docker.io/swebench/... and jefzda/sweap-images:... will be prefixed correctly.
+# - For PolyBench (ghcr.io/timesler/...), set:
+#     export MSWEA_DOCKER_IMAGE_REGISTRY=ghcr.nju.edu.cn
+#   so pulls use ghcr.nju.edu.cn/timesler/... (see docker_image_registry.apply_registry_mirror_prefix).
 #
 # Usage examples:
 #   bash tools/pull_mini_swe_docker_images.sh
@@ -84,7 +87,10 @@ MINISWE_SRC = os.path.join(
 MINISWE_SRC = os.path.abspath(MINISWE_SRC)
 sys.path.insert(0, MINISWE_SRC)
 
-from minisweagent.run.extra.docker_image_registry import apply_docker_image_registry_prefix
+from minisweagent.run.extra.docker_image_registry import (
+    apply_docker_image_registry_prefix,
+    apply_registry_mirror_prefix,
+)
 
 
 def get_swebench_docker_image_name(instance: dict) -> str:
@@ -101,6 +107,8 @@ def get_swebench_docker_image_name(instance: dict) -> str:
             image_name = f"ghcr.io/timesler/swe-polybench.eval.x86_64.{iid}:latest"
         else:
             image_name = f"docker.io/swebench/sweb.eval.x86_64.{id_docker_compatible}:latest".lower()
+    if image_name.startswith("ghcr.io/"):
+        return apply_registry_mirror_prefix(image_name)
     return apply_docker_image_registry_prefix(image_name)
 
 
@@ -185,8 +193,10 @@ def compute_image_for_instance(bench: str, inst: dict) -> Optional[str]:
     if bench == "Verified":
         return get_swebench_docker_image_name(inst)
     if bench == "Poly":
-        # PolyBenchStrategy priority 1: ghcr.io/timesler/swe-polybench.eval.x86_64.{instance_id}:latest
-        return apply_docker_image_registry_prefix(f"ghcr.io/timesler/swe-polybench.eval.x86_64.{iid}:latest")
+        # PolyBenchStrategy: ghcr; mirror with MSWEA_DOCKER_IMAGE_REGISTRY (e.g. ghcr.nju.edu.cn)
+        return apply_registry_mirror_prefix(
+            f"ghcr.io/timesler/swe-polybench.eval.x86_64.{iid}:latest"
+        )
     if bench == "Pro":
         # SWE-bench Pro dataset typically stores repo as "org/repo".
         # Be defensive in case the schema differs.

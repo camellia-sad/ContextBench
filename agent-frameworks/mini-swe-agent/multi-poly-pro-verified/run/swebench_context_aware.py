@@ -10,7 +10,7 @@ import threading
 import time
 import traceback
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import typer
 import yaml
@@ -24,6 +24,10 @@ from minisweagent import Environment, global_config_dir
 from minisweagent.agents.context_aware import ContextAwareAgent
 from minisweagent.config import builtin_config_dir, get_config_path
 from minisweagent.models import get_model
+from minisweagent.run.extra.docker_image_registry import (
+    apply_docker_image_registry_prefix,
+    apply_registry_mirror_prefix,
+)
 from minisweagent.run.extra.swebench import DATASET_MAPPING, get_sb_environment
 from minisweagent.run.extra.utils.batch_progress import RunBatchProgressManager
 from minisweagent.run.utils.save import save_traj
@@ -218,23 +222,29 @@ class PolyBenchStrategy(DockerStrategy):
     
     def get_docker_config(self, instance: dict, auto_pull: bool = True) -> dict:
         instance_id = instance.get("instance_id", "")
-        
-        # Try Priority 1: PolyBench pre-built image
-        polybench_image = f"ghcr.io/timesler/swe-polybench.eval.x86_64.{instance_id}:latest"
-        
-        if auto_pull and DockerConfigExtractor.pull_image_if_needed(polybench_image, pull_timeout=600):
-            cwd = _detect_docker_image_workdir(polybench_image) or "/testbed"
-            return {
-                "base_image": polybench_image,
-                "dockerfile_content": None,
-                "source": "polybench",
-                "cwd": cwd,
-                "timeout": 120,
-                "pull_timeout": 600,
-                "run_args": ["--rm", "--platform", "linux/amd64"],
-            }
-        
-        # Try Priority 2: Extract Dockerfile from poly data
+
+        base_ghcr = f"ghcr.io/timesler/swe-polybench.eval.x86_64.{instance_id}:latest"
+        mirrored = apply_registry_mirror_prefix(base_ghcr)
+        image_candidates: list[str] = []
+        for u in (mirrored, base_ghcr):
+            if u and u not in image_candidates:
+                image_candidates.append(u)
+        if auto_pull:
+            resolved = DockerConfigExtractor.resolve_polybench_prebuilt_image(
+                instance_id, pull_timeout=600
+            )
+            if resolved:
+                cwd = _detect_docker_image_workdir(resolved) or "/testbed"
+                return {
+                    "base_image": resolved,
+                    "dockerfile_content": None,
+                    "source": "polybench",
+                    "cwd": cwd,
+                    "timeout": 120,
+                    "pull_timeout": 600,
+                    "run_args": ["--rm", "--platform", "linux/amd64"],
+                }
+
         if self.poly_data_dir and self.poly_data_dir.exists():
             dockerfile_content = DockerConfigExtractor.extract_dockerfile_from_poly_data(
                 self.poly_data_dir, instance_id
@@ -249,10 +259,12 @@ class PolyBenchStrategy(DockerStrategy):
                     "pull_timeout": 600,
                     "run_args": ["--rm", "--platform", "linux/amd64"],
                 }
-        
+
         raise RuntimeError(
             f"No Docker configuration found for PolyBench instance {instance_id}. "
-            f"Neither pre-built image nor Dockerfile from poly data available."
+            f"Tried pre-built ref(s) / local scan for: {image_candidates}. "
+            f"Pull or import (e.g. `docker pull <uri>`), align DOCKER_HOST with your CLI, "
+            f"or pass --poly-data-dir. For NJU mirror: export MSWEA_DOCKER_IMAGE_REGISTRY=ghcr.nju.edu.cn"
         )
     
     def get_environment_config(self, instance: dict, docker_config: dict) -> dict:
@@ -394,7 +406,8 @@ class DockerConfigExtractor:
         if not pr_number or not pr_number.isdigit():
             return ""
             
-        return f"mswebench/{org_clean}_m_{repo_clean}:pr-{pr_number}"
+        image = f"mswebench/{org_clean}_m_{repo_clean}:pr-{pr_number}"
+        return apply_docker_image_registry_prefix(image)
 
     @staticmethod
     def pull_image_if_needed(image_uri: str, pull_timeout: int = 300) -> bool:
@@ -412,7 +425,9 @@ class DockerConfigExtractor:
             
         try:
             import docker
-            client = docker.from_env(timeout=pull_timeout)
+            from minisweagent.run.extra.docker_client import docker_from_env
+
+            client = docker_from_env(timeout=pull_timeout)
             
             # PRIORITY 1: Check if image exists locally (fastest, no network needed)
             try:
@@ -441,6 +456,73 @@ class DockerConfigExtractor:
         except Exception as e:
             logger.error(f"Docker client error for {image_uri}: {e}")
             return False
+
+    @staticmethod
+    def _find_local_polybench_tag_by_instance_id(client, instance_id: str) -> Optional[str]:
+        if not instance_id:
+            return None
+        needle = f"swe-polybench.eval.x86_64.{instance_id}"
+        try:
+            for im in client.images.list():
+                for tag in im.tags or []:
+                    if needle not in tag:
+                        continue
+                    if tag.endswith(":latest") or (":" in tag and tag.rsplit(":", 1)[-1] == "latest"):
+                        return tag
+        except Exception as e:
+            logger.warning(f"Local PolyBench image list scan failed: {e}")
+        return None
+
+    @staticmethod
+    def resolve_polybench_prebuilt_image(instance_id: str, pull_timeout: int = 600) -> Optional[str]:
+        if not instance_id:
+            return None
+        base_ghcr = f"ghcr.io/timesler/swe-polybench.eval.x86_64.{instance_id}:latest"
+        mirrored = apply_registry_mirror_prefix(base_ghcr)
+        local_order: List[str] = []
+        for u in (mirrored, base_ghcr):
+            if u and u not in local_order:
+                local_order.append(u)
+        if mirrored != base_ghcr:
+            pull_uris: List[str] = [mirrored]
+        else:
+            pull_uris = [base_ghcr]
+        try:
+            import docker
+            from minisweagent.run.extra.docker_client import docker_from_env
+
+            client = docker_from_env(timeout=pull_timeout)
+        except Exception as e:
+            logger.error(
+                "Cannot create Docker client — local images cannot be used and pull will not run: %s\n"
+                "  This is not 'missing image': the engine API (e.g. unversioned GET /version) was denied or unreachable.\n"
+                "  If `docker` in your shell works, use the same DOCKER_HOST/TLS, or set DOCKER_API_VERSION to match the server.\n"
+                "  403 with opa-docker-authz: some policies only allow /v1.xx/... and block the legacy /version probe (docker-py's default).",
+                e,
+            )
+            return None
+        for uri in local_order:
+            try:
+                client.images.get(uri)
+                logger.info(f"✓ Using locally cached image: {uri}")
+                return uri
+            except docker.errors.ImageNotFound:
+                continue
+            except Exception as e:
+                logger.warning(f"Error checking local image {uri}: {e}")
+        found = DockerConfigExtractor._find_local_polybench_tag_by_instance_id(client, instance_id)
+        if found:
+            logger.info(f"✓ Using locally cached image (name scan): {found}")
+            return found
+        for uri in pull_uris:
+            try:
+                logger.info(f"⬇️  Pulling Docker image: {uri} (timeout: {pull_timeout}s)")
+                client.images.pull(uri, platform="linux/amd64")
+                logger.info(f"✓ Successfully pulled: {uri}")
+                return uri
+            except Exception as e:
+                logger.error(f"✗ Failed to pull {uri}: {e}")
+        return None
 
     @staticmethod
     def extract_dockerfile_from_patch(model_patch: str) -> Optional[str]:
@@ -723,9 +805,9 @@ def _detect_docker_image_workdir(image_name: str) -> Optional[str]:
         # Docker returns empty string if WORKDIR wasn't set, defaulting to "/"
         if not workdir or workdir == "/":
             # Multi-SWE-bench pattern: check /home/{repo} first
-            if image_name.startswith("mswebench/"):
+            if image_name.startswith("mswebench/") or "/mswebench/" in image_name:
                 # Extract repo name from mswebench/{org}_m_{repo}:tag pattern
-                repo_part = image_name.split("/")[1].split(":")[0]  # get org_m_repo part
+                repo_part = image_name.rsplit("/", 1)[-1].split(":")[0]  # get org_m_repo part
                 if "_m_" in repo_part:
                     repo_name = repo_part.split("_m_", 1)[1].replace("_", "-")
                     potential_dirs = [f"/home/{repo_name}", "/home", "/testbed", "/app", "/workspace"]

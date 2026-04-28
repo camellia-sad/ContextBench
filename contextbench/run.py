@@ -39,6 +39,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import json
 import os
@@ -52,8 +53,18 @@ from typing import Any, Dict, List, Optional, Tuple
 # Repo root (Context-Bench)
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AGENT_FRAMEWORKS = REPO_ROOT / "agent-frameworks"
+# For --agent miniswe, a relative -o is resolved against this (same tree as swebench_context_aware cwd / output_vllm).
+MINISWE_OUTPUT_ROOT = (
+    AGENT_FRAMEWORKS
+    / "mini-swe-agent"
+    / "multi-poly-pro-verified"
+    / "mini-swe-agent"
+    / "src"
+)
 DEFAULT_TASK_CSV = REPO_ROOT / "data" / "selected_500_instances.csv"
 _DEBUG = False
+XUANYUAN_REGISTRY = "fczi514j9ggm7b.xuanyuan.run"
+NJU_GHCR_REGISTRY = "ghcr.nju.edu.cn"
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +99,12 @@ def detect_bench_from_instance_id(instance_id: str, original_inst_id: str = "") 
         return "Verified"
     return "Verified"
 
+
+# tools/analyze_traj_info.py --compare-csv uses, per row:
+#   canonical = (original_inst_id or instance_id).strip()  # see load_expected_ids_from_csv
+# Traj dirs: parent of each *.traj.json (one of the two when only one is used as the folder name).
+# --instances and preds.json short-circuit below match the CSV `instance_id` and `original_inst_id`
+# columns as plain strings; any --instances token from the analyze script is one of these two.
 
 # ---------------------------------------------------------------------------
 # Task list loading
@@ -152,7 +169,9 @@ def _clear_previous_outputs(agent: str, bench: str, output_dir: Path, instance_i
     if not base.exists():
         return
     if agent == "miniswe":
-        for pattern in ("preds.json", "minisweagent.log", "exit_statuses_*.yaml"):
+        # preds.json is removed once at run start when --rerun (see main); not here, to avoid
+        # clearing preds between concurrent instance runs.
+        for pattern in ("minisweagent.log", "exit_statuses_*.yaml"):
             for path in base.glob(pattern):
                 if path.is_dir():
                     shutil.rmtree(path, ignore_errors=True)
@@ -475,44 +494,100 @@ def run_miniswe(task: Dict[str, Any], output_dir: Path, timeout: int = 1800) -> 
         "Multi": "multi-swe-bench",
     }
     subset = subset_map.get(bench, "verified")
-    out_subdir = output_dir / "miniswe" / bench
+    out_subdir = (output_dir / "miniswe" / bench).resolve()
     out_subdir.mkdir(parents=True, exist_ok=True)
 
     # Select MiniSWE config by bench:
-    # - Verified/Pro/Poly → swebench_following_context.yaml
-    # - Multi → swebench_multi.yaml
+    # - Verified/Pro/Poly → swebench_following_context_strict.yaml
+    # - Multi → swebench_multi_strict.yaml
     miniswe_root = AGENT_FRAMEWORKS / "mini-swe-agent" / "multi-poly-pro-verified"
     if bench == "Multi":
-        config_name = "swebench_multi.yaml"
+        config_name = "swebench_multi_strict.yaml"
     else:
-        config_name = "swebench_following_context.yaml"
+        config_name = "swebench_following_context_strict.yaml"
     config_file = miniswe_root / "configs" / config_name
     if not config_file.exists():
         return False, f"Config file not found: {config_file}"
     
     env = os.environ.copy()
+    # Per-bench Docker mirror policy:
+    # - Poly: use NJU for image pulls
+    # - Non-Poly: use Xuanyuan for image pulls
+    # Always keep Poly-specific GHCR host and clear legacy override.
+    if bench == "Poly":
+        env["MSWEA_DOCKER_IMAGE_REGISTRY"] = NJU_GHCR_REGISTRY
+    else:
+        env["MSWEA_DOCKER_IMAGE_REGISTRY"] = XUANYUAN_REGISTRY
+    env["MSWEA_POLY_GHCR_REGISTRY"] = NJU_GHCR_REGISTRY
+    env.pop("MSWEA_GHCR_MIRROR", None)
     env["PYTHONPATH"] = f"{miniswe_src}:{env.get('PYTHONPATH', '')}"
     # Run via python -m minisweagent.run.extra.swebench_context_aware
     # Note: using split='test' as that's the correct split name for SWE-bench datasets
+    # One instance per ContextBench task: inner -w is always 1. Parallelism is from
+    # contextbench.run --workers (concurrent miniswe subprocesses), not this flag.
     cmd = [
         sys.executable, "-m", "minisweagent.run.extra.swebench_context_aware",
         "--subset", subset,
         "--split", "test",
         "--config", str(config_file),
         "--filter", f"^{filter_id}$",
-        "--output", str(out_subdir),
+        "--output", str(out_subdir.resolve()),
+        "-w",
+        "1",
     ]
     mopts = task.get("_miniswe") or {}
-    w = int(mopts.get("workers", 1) or 1)
-    if w > 0:
-        cmd.extend(["-w", str(w)])
+    # When CLI passes --rerun, main() sets CONTEXTBENCH_MINISWE_RERUN so this stays true even if
+    # a task dict ever loses _miniswe (otherwise we "skip (already in preds.json)" and never re-run).
+    miniswe_rerun = bool(
+        mopts.get("rerun", False) or os.environ.get("CONTEXTBENCH_MINISWE_RERUN") == "1"
+    )
     srt = mopts.get("step_response_timeout")
     if srt is not None:
         cmd.extend(["--step-response-timeout", str(float(srt))])
+    if miniswe_rerun:
+        # Must match swebench: without this, parallel workers read preds written by other workers and
+        # filter out "existing" instance_ids → 0 instances and no preds update for those runs.
+        cmd.append("--redo-existing")
+    if not miniswe_rerun:
+        preds_path = out_subdir / "preds.json"
+        if preds_path.exists():
+            try:
+                preds_data = json.loads(preds_path.read_text())
+                for key in (instance_id, orig_id):
+                    if key and str(key) in preds_data:
+                        return (
+                            True,
+                            f"skip (already in {preds_path.name})",
+                        )
+            except (json.JSONDecodeError, OSError):
+                pass
+    # HF task instance_id is often short (e.g. org__repo-123) while ContextBench CSV also has
+    # a long SWE-PolyBench__... in instance_id; on-disk output follows the dataset's instance_id.
+    def _traj_paths() -> list[Path]:
+        seen: set[str] = set()
+        paths: list[Path] = []
+        for name in (orig_id, instance_id):
+            n = (name or "").strip()
+            if n and n not in seen:
+                seen.add(n)
+                paths.append(out_subdir / n / f"{n}.traj.json")
+        return paths
+
+    traj_paths = _traj_paths()
     try:
         result = _run_subprocess(cmd, cwd=str(miniswe_src), env=env, timeout=timeout, debug=_DEBUG)
         if result.returncode == 0:
-            return True, f"traj in {out_subdir}"
+            for tf in traj_paths:
+                if tf.is_file():
+                    return True, f"traj in {tf}"
+            # swebench used to exit 0 even when instance failed in a thread; that is fixed, but
+            # still validate so Poly short-dir vs long CSV id does not look like a false "done".
+            log_hint = f" (see {out_subdir / 'minisweagent.log'})" if (out_subdir / "minisweagent.log").is_file() else ""
+            return (
+                False,
+                f"miniswe exit 0 but no .traj.json under {out_subdir!s} for this task{log_hint}. "
+                f"stderr: {(result.stderr or '')[:1500]!r}",
+            )
         return False, result.stderr or result.stdout or f"exit {result.returncode}"
     except subprocess.TimeoutExpired:
         return False, f"Timeout after {timeout}s"
@@ -785,7 +860,8 @@ def main() -> int:
         "--instances",
         type=str,
         default=None,
-        help="Comma-separated instance_id or original_inst_id to run only those",
+        help="Comma-separated: must match a row's instance_id or original_inst_id in the task CSV "
+        "(see tools/analyze_traj_info.py: canonical = original_inst_id or instance_id).",
     )
     ap.add_argument(
         "--task-csv",
@@ -810,7 +886,10 @@ def main() -> int:
         "-o",
         type=Path,
         default=REPO_ROOT / "results" / "agent_runs",
-        help="Output directory for trajectories",
+        help=(
+            "Output directory for trajectories. For --agent miniswe, a relative -o is resolved under "
+            "agent-frameworks/mini-swe-agent/.../mini-swe-agent/src (not the shell cwd); use an absolute -o to override."
+        ),
     )
     ap.add_argument(
         "--limit",
@@ -873,9 +952,15 @@ def main() -> int:
         default=1,
         metavar="N",
         dest="miniswe_workers",
-        help="For --agent miniswe: parallel instances (-w) for swebench_context_aware. Ignored for other agents.",
+        help="For --agent miniswe: how many instance subprocesses to run in parallel. "
+        "Each subprocess still uses swebench_context_aware -w 1 (one instance). Ignored for other agents.",
     )
     args = ap.parse_args()
+    out = args.output.expanduser()
+    if args.agent == "miniswe" and not out.is_absolute():
+        args.output = (MINISWE_OUTPUT_ROOT / out).resolve()
+    else:
+        args.output = out.resolve()
     global _DEBUG
     _DEBUG = bool(args.debug)
 
@@ -927,6 +1012,12 @@ def main() -> int:
     if args.dry_run:
         return 0
 
+    if args.agent == "miniswe":
+        if args.rerun:
+            os.environ["CONTEXTBENCH_MINISWE_RERUN"] = "1"
+        else:
+            os.environ.pop("CONTEXTBENCH_MINISWE_RERUN", None)
+
     # Apply agent-specific env overrides from CLI
     if args.sweagent_config:
         os.environ["SWEAGENT_CONFIG"] = args.sweagent_config
@@ -946,31 +1037,100 @@ def main() -> int:
         os.environ["OPENAI_API_KEY"] = llm_key
 
     args.output.mkdir(parents=True, exist_ok=True)
+    if args.rerun and args.agent == "miniswe":
+        for bench in {t.get("bench", "Verified") for t in tasks}:
+            pred = (args.output / "miniswe" / bench / "preds.json").resolve()
+            lock = pred.parent / f".{pred.name}.flock"
+            for p in (pred, lock):
+                if p.is_file():
+                    try:
+                        p.unlink()
+                        print(f"Rerun: removed {p}", file=sys.stderr, flush=True)
+                    except OSError as e:
+                        print(f"Rerun: could not remove {p}: {e}", file=sys.stderr, flush=True)
     success = 0
     failed = 0
-    for i, task in enumerate(tasks):
-        task = dict(task)
+
+    def _prepare_task(task: Dict[str, Any]) -> Dict[str, Any]:
+        t = dict(task)
         if args.agent == "miniswe":
-            task["_miniswe"] = {
-                "workers": int(args.miniswe_workers or 1),
+            t["_miniswe"] = {
                 "step_response_timeout": args.miniswe_step_response_timeout,
+                "rerun": args.rerun,
             }
-        inst = task.get("instance_id") or task.get("original_inst_id", "?")
-        print(f"[{i+1}/{len(tasks)}] {args.agent} | {task['bench']} | {inst} ...", flush=True)
-        if args.rerun:
-            _clear_previous_outputs(
-                args.agent,
-                task.get("bench", "Verified"),
-                args.output,
-                [task.get("instance_id", ""), task.get("original_inst_id", "")],
+        return t
+
+    n_workers = int(getattr(args, "miniswe_workers", 1) or 1)
+    use_pool = args.agent == "miniswe" and n_workers > 1
+    if use_pool:
+        # Only keep up to n_workers runs in flight: print + submit the next when one finishes
+        # (a plain loop that submit()s the whole list would print all N lines at once on the main thread).
+        n_tasks = len(tasks)
+        next_i = 0
+        in_flight: dict[concurrent.futures.Future, Tuple[int, str]] = {}
+
+        def _submit_for_index(i: int) -> None:
+            t0 = tasks[i]
+            task = _prepare_task(t0)
+            inst = task.get("instance_id") or task.get("original_inst_id", "?")
+            print(
+                f"[{i + 1}/{n_tasks}] {args.agent} | {task['bench']} | {inst} ...",
+                flush=True,
             )
-        ok, msg = run_instance(args.agent, task, args.output, timeout=args.timeout)
-        if ok:
-            success += 1
-            print(f"  ✓ {msg}", flush=True)
-        else:
-            failed += 1
-            print(f"  ✗ {msg}", flush=True)
+            if args.rerun:
+                _clear_previous_outputs(
+                    args.agent,
+                    task.get("bench", "Verified"),
+                    args.output,
+                    [task.get("instance_id", ""), task.get("original_inst_id", "")],
+                )
+            in_flight[
+                pool.submit(run_instance, args.agent, task, args.output, args.timeout)
+            ] = (i, inst)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
+            while next_i < n_tasks and len(in_flight) < n_workers:
+                _submit_for_index(next_i)
+                next_i += 1
+            while in_flight:
+                done, _ = concurrent.futures.wait(
+                    in_flight,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for fut in done:
+                    i, inst = in_flight.pop(fut)
+                    try:
+                        ok, msg = fut.result()
+                    except Exception as e:
+                        ok, msg = False, str(e)
+                    if ok:
+                        success += 1
+                        print(f"  ✓ [{i + 1}] {inst} {msg}", flush=True)
+                    else:
+                        failed += 1
+                        print(f"  ✗ [{i + 1}] {inst} {msg}", flush=True)
+                    if next_i < n_tasks:
+                        _submit_for_index(next_i)
+                        next_i += 1
+    else:
+        for i, t in enumerate(tasks):
+            task = _prepare_task(t)
+            inst = task.get("instance_id") or task.get("original_inst_id", "?")
+            print(f"[{i+1}/{len(tasks)}] {args.agent} | {task['bench']} | {inst} ...", flush=True)
+            if args.rerun:
+                _clear_previous_outputs(
+                    args.agent,
+                    task.get("bench", "Verified"),
+                    args.output,
+                    [task.get("instance_id", ""), task.get("original_inst_id", "")],
+                )
+            ok, msg = run_instance(args.agent, task, args.output, timeout=args.timeout)
+            if ok:
+                success += 1
+                print(f"  ✓ {msg}", flush=True)
+            else:
+                failed += 1
+                print(f"  ✗ {msg}", flush=True)
 
     print(f"\nDone: {success} succeeded, {failed} failed", file=sys.stderr)
     return 0 if failed == 0 else 1
