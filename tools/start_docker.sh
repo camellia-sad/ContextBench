@@ -61,7 +61,9 @@ exec env \
   --name "${DOCKER_CONTAINER_NAME}" \
   --gpus 4 \
   -e GPU_DEVICES="${GPU_DEVICES}" \
-  -e HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}" \
+  -e HF_ENDPOINT="${HF_ENDPOINT:-https://huggingface.co}" \
+  -e HF_TOKEN="${HF_TOKEN:-${HUGGINGFACE_HUB_TOKEN:-}}" \
+  -e HUGGINGFACE_HUB_TOKEN="${HUGGINGFACE_HUB_TOKEN:-${HF_TOKEN:-}}" \
   -e PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}" \
   -e PIP_TRUSTED_HOST="${PIP_TRUSTED_HOST:-pypi.tuna.tsinghua.edu.cn}" \
   -e HF_HOME="${DOCKER_WORKSPACE_CONTAINER}/hf_cache" \

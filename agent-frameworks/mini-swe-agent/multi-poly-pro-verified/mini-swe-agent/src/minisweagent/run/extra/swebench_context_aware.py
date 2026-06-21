@@ -245,9 +245,11 @@ class PolyBenchStrategy(DockerStrategy):
     
     def get_docker_config(self, instance: dict, auto_pull: bool = True) -> dict:
         instance_id = instance.get("instance_id", "")
+        # Docker image repository names must be lowercase; Poly GHCR tags use lowercased instance slug.
+        poly_slug = instance_id.strip().lower()
 
         # Priority 1: Poly pre-built. Local first (exact names, then any tag for this instance), then pull.
-        base_ghcr = f"ghcr.io/timesler/swe-polybench.eval.x86_64.{instance_id}:latest"
+        base_ghcr = f"ghcr.io/timesler/swe-polybench.eval.x86_64.{poly_slug}:latest"
         mirrored = apply_registry_mirror_prefix(base_ghcr)
         image_candidates: list[str] = []
         for u in (mirrored, base_ghcr):
@@ -255,7 +257,7 @@ class PolyBenchStrategy(DockerStrategy):
                 image_candidates.append(u)
         if auto_pull:
             resolved = DockerConfigExtractor.resolve_polybench_prebuilt_image(
-                instance_id, pull_timeout=600
+                poly_slug, pull_timeout=600
             )
             if resolved:
                 cwd = _detect_docker_image_workdir(resolved) or "/testbed"
@@ -399,7 +401,8 @@ class DockerConfigExtractor:
         if len(tag) > 128:
             tag = tag[:128]
             
-        return f"jefzda/sweap-images:{tag}"
+        image = f"jefzda/sweap-images:{tag}"
+        return apply_docker_image_registry_prefix(image)
 
     @staticmethod
     def get_multiswe_image_uri(instance_id: str, repo_name: str = "", pr_number: str = "") -> str:
@@ -487,11 +490,11 @@ class DockerConfigExtractor:
         """If any local image is tagged for this Poly instance (any registry host), return that ref."""
         if not instance_id:
             return None
-        needle = f"swe-polybench.eval.x86_64.{instance_id}"
+        needle = f"swe-polybench.eval.x86_64.{instance_id.strip().lower()}"
         try:
             for im in client.images.list():
                 for tag in im.tags or []:
-                    if needle not in tag:
+                    if needle not in tag.lower():
                         continue
                     if tag.endswith(":latest") or (":" in tag and tag.rsplit(":", 1)[-1] == "latest"):
                         return tag
@@ -504,20 +507,21 @@ class DockerConfigExtractor:
         """Poly pre-built: local only first (exact + tag scan), then pull.
 
         *Local checks* try both mirror name (e.g. ghcr.nju.edu.cn/...) and ghcr.io/... if different.
-        *Pull* is Poly-only: if ``MSWEA_DOCKER_IMAGE_REGISTRY`` rewrites ghcr (e.g. to ghcr.nju.edu.cn),
-        only that mirror URL is pulled — not public ghcr.io. If unset, only ghcr.io is pulled.
+        *Pull*: try the GHCR mirror host first (``MSWEA_POLY_GHCR_REGISTRY`` → e.g. ghcr.nju.edu.cn),
+        then fall back to ``ghcr.io/...`` if the mirror pull fails (NJU may not sync every tag).
         Other benches (Verified/Pro/Multi) use ``apply_docker_image_registry_prefix`` + their own hosts.
         """
-        if not instance_id:
+        slug = (instance_id or "").strip().lower()
+        if not slug:
             return None
-        base_ghcr = f"ghcr.io/timesler/swe-polybench.eval.x86_64.{instance_id}:latest"
+        base_ghcr = f"ghcr.io/timesler/swe-polybench.eval.x86_64.{slug}:latest"
         mirrored = apply_registry_mirror_prefix(base_ghcr)
         local_order: List[str] = []
         for u in (mirrored, base_ghcr):
             if u and u not in local_order:
                 local_order.append(u)
         if mirrored != base_ghcr:
-            pull_uris: List[str] = [mirrored]
+            pull_uris = [mirrored, base_ghcr]
         else:
             pull_uris = [base_ghcr]
         try:
@@ -543,7 +547,7 @@ class DockerConfigExtractor:
                 continue
             except Exception as e:
                 logger.warning(f"Error checking local image {uri}: {e}")
-        found = DockerConfigExtractor._find_local_polybench_tag_by_instance_id(client, instance_id)
+        found = DockerConfigExtractor._find_local_polybench_tag_by_instance_id(client, slug)
         if found:
             logger.info(f"✓ Using locally cached image (name scan): {found}")
             return found

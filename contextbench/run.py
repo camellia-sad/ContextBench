@@ -525,6 +525,14 @@ def run_miniswe(task: Dict[str, Any], output_dir: Path, timeout: int = 1800) -> 
     # Note: using split='test' as that's the correct split name for SWE-bench datasets
     # One instance per ContextBench task: inner -w is always 1. Parallelism is from
     # contextbench.run --workers (concurrent miniswe subprocesses), not this flag.
+    miniswe_model = (
+        os.environ.get("MINISWE_VLLM_MODEL")
+        or os.environ.get("VLLM_MODEL")
+        or "hosted_vllm/facebook/cwm"
+    )
+    if miniswe_model and not miniswe_model.startswith("hosted_vllm/"):
+        miniswe_model = f"hosted_vllm/{miniswe_model}"
+
     cmd = [
         sys.executable, "-m", "minisweagent.run.extra.swebench_context_aware",
         "--subset", subset,
@@ -532,6 +540,7 @@ def run_miniswe(task: Dict[str, Any], output_dir: Path, timeout: int = 1800) -> 
         "--config", str(config_file),
         "--filter", f"^{filter_id}$",
         "--output", str(out_subdir.resolve()),
+        "-m", miniswe_model,
         "-w",
         "1",
     ]

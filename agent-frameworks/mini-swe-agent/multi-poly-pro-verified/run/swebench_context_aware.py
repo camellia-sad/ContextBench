@@ -222,8 +222,10 @@ class PolyBenchStrategy(DockerStrategy):
     
     def get_docker_config(self, instance: dict, auto_pull: bool = True) -> dict:
         instance_id = instance.get("instance_id", "")
+        # Docker image repository names must be lowercase; Poly GHCR tags use lowercased instance slug.
+        poly_slug = instance_id.strip().lower()
 
-        base_ghcr = f"ghcr.io/timesler/swe-polybench.eval.x86_64.{instance_id}:latest"
+        base_ghcr = f"ghcr.io/timesler/swe-polybench.eval.x86_64.{poly_slug}:latest"
         mirrored = apply_registry_mirror_prefix(base_ghcr)
         image_candidates: list[str] = []
         for u in (mirrored, base_ghcr):
@@ -231,7 +233,7 @@ class PolyBenchStrategy(DockerStrategy):
                 image_candidates.append(u)
         if auto_pull:
             resolved = DockerConfigExtractor.resolve_polybench_prebuilt_image(
-                instance_id, pull_timeout=600
+                poly_slug, pull_timeout=600
             )
             if resolved:
                 cwd = _detect_docker_image_workdir(resolved) or "/testbed"
@@ -461,11 +463,11 @@ class DockerConfigExtractor:
     def _find_local_polybench_tag_by_instance_id(client, instance_id: str) -> Optional[str]:
         if not instance_id:
             return None
-        needle = f"swe-polybench.eval.x86_64.{instance_id}"
+        needle = f"swe-polybench.eval.x86_64.{instance_id.strip().lower()}"
         try:
             for im in client.images.list():
                 for tag in im.tags or []:
-                    if needle not in tag:
+                    if needle not in tag.lower():
                         continue
                     if tag.endswith(":latest") or (":" in tag and tag.rsplit(":", 1)[-1] == "latest"):
                         return tag
@@ -475,16 +477,18 @@ class DockerConfigExtractor:
 
     @staticmethod
     def resolve_polybench_prebuilt_image(instance_id: str, pull_timeout: int = 600) -> Optional[str]:
-        if not instance_id:
+        """Poly pre-built: local first, then pull mirror then ghcr.io if mirror differs."""
+        slug = (instance_id or "").strip().lower()
+        if not slug:
             return None
-        base_ghcr = f"ghcr.io/timesler/swe-polybench.eval.x86_64.{instance_id}:latest"
+        base_ghcr = f"ghcr.io/timesler/swe-polybench.eval.x86_64.{slug}:latest"
         mirrored = apply_registry_mirror_prefix(base_ghcr)
         local_order: List[str] = []
         for u in (mirrored, base_ghcr):
             if u and u not in local_order:
                 local_order.append(u)
         if mirrored != base_ghcr:
-            pull_uris: List[str] = [mirrored]
+            pull_uris: List[str] = [mirrored, base_ghcr]
         else:
             pull_uris = [base_ghcr]
         try:
@@ -510,7 +514,7 @@ class DockerConfigExtractor:
                 continue
             except Exception as e:
                 logger.warning(f"Error checking local image {uri}: {e}")
-        found = DockerConfigExtractor._find_local_polybench_tag_by_instance_id(client, instance_id)
+        found = DockerConfigExtractor._find_local_polybench_tag_by_instance_id(client, slug)
         if found:
             logger.info(f"✓ Using locally cached image (name scan): {found}")
             return found

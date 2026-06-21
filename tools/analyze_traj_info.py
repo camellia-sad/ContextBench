@@ -28,6 +28,9 @@ Example:
     # Only output comma-separated ids for one/more statuses:
     python tools/analyze_traj_info.py <root> --status-instances-only InternalServerError StepResponseTimeout
 
+    # Submitted but submission does not look like a unified diff (--git) patch:
+    python tools/analyze_traj_info.py <root> --submitted-not-diff-instances-only
+
     # Union status ids with "missing traj" ids from CSV:
     python tools/analyze_traj_info.py <root> --status-instances-only InternalServerError \
         --compare-csv --include-missing-from-csv
@@ -135,6 +138,29 @@ def collect_traj_instance_ids(root: Path) -> Set[str]:
     return found
 
 
+def collect_submitted_not_diff_instance_ids(root: Path) -> list[str]:
+    """Ids where exit_status is Submitted but submission fails looks_like_diff_patch."""
+    if not root.exists():
+        raise SystemExit(f"Root directory does not exist: {root}")
+
+    selected: Set[str] = set()
+    for p in sorted(root.rglob("*.traj.json")):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        info = data.get("info", {})
+        status = str(info.get("exit_status", "") or "").strip()
+        if status != "Submitted":
+            continue
+        submission = str(info.get("submission", "") or "")
+        if looks_like_diff_patch(submission):
+            continue
+        iid = _resolve_instance_id(data, p)
+        selected.add(iid)
+    return sorted(selected)
+
+
 def _csv_rel_or_abs(csv_path: Path) -> str:
     try:
         return str(csv_path.relative_to(REPO_ROOT))
@@ -147,6 +173,10 @@ def print_rerun_instances_hint(
     *,
     csv_path: Path,
     bench: str,
+    selection_note: str = (
+        "These ids match CSV `original_inst_id` or `instance_id` "
+        "(same as used for traj dir names where applicable)."
+    ),
 ) -> None:
     """Print --instances value and a copy-paste contextbench.run example.
 
@@ -157,9 +187,7 @@ def print_rerun_instances_hint(
     joined = ",".join(missing)
     print()
     print("=== Rerun: contextbench.run --instances ===")
-    print(
-        "These ids match CSV `original_inst_id` or `instance_id` (same as used for traj dir names where applicable)."
-    )
+    print(selection_note)
     print()
     print(f"  --instances {shlex.quote(joined)}")
     print()
@@ -169,7 +197,7 @@ def print_rerun_instances_hint(
         f"python -m contextbench.run --agent miniswe "
         f"--task-csv {shlex.quote(csv_disp)} --bench {shlex.quote(bench)} "
         f"--timeout 3600 --miniswe-step-response-timeout 300 "
-        f"-o output_vllm/select_500_deepseek_coder_33b --instances {shlex.quote(joined)}"
+        f"-o output_vllm/select_500_qwen_32b --instances {shlex.quote(joined)}"
         f" --workers 12 --rerun "
     )
     print(f"  {ex}")
@@ -413,12 +441,32 @@ def main() -> None:
             "CSV-missing ids."
         ),
     )
+    ap.add_argument(
+        "--submitted-not-diff-instances-only",
+        action="store_true",
+        help=(
+            "Print comma-separated instance ids whose exit_status is Submitted but whose "
+            "submission does not look like a unified diff (--git) patch "
+            "(same heuristic as the stats matrix). Skips default scan summary."
+        ),
+    )
     args = ap.parse_args()
 
     if args.instances_only and args.compare_csv is None:
         raise SystemExit("--instances-only requires --compare-csv")
     if args.instances_only and args.status_instances_only:
         raise SystemExit("--instances-only cannot be used with --status-instances-only")
+    if args.instances_only and args.submitted_not_diff_instances_only:
+        raise SystemExit("--instances-only cannot be used with --submitted-not-diff-instances-only")
+    if args.status_instances_only and args.submitted_not_diff_instances_only:
+        raise SystemExit(
+            "--status-instances-only cannot be used with --submitted-not-diff-instances-only"
+        )
+    if args.submitted_not_diff_instances_only and args.include_missing_from_csv:
+        raise SystemExit(
+            "--include-missing-from-csv is only defined for --status-instances-only (not for "
+            "--submitted-not-diff-instances-only)"
+        )
     if args.include_missing_from_csv and args.compare_csv is None:
         raise SystemExit("--include-missing-from-csv requires --compare-csv")
 
@@ -448,6 +496,13 @@ def main() -> None:
             bench, _src = resolve_bench()
             missing = compare_csv_missing_ids_only(args.root, args.compare_csv, bench)
             selected = sorted(set(selected).union(missing))
+        sys.stdout.write(",".join(selected))
+        if selected:
+            sys.stdout.write("\n")
+        return
+
+    if args.submitted_not_diff_instances_only:
+        selected = collect_submitted_not_diff_instance_ids(args.root)
         sys.stdout.write(",".join(selected))
         if selected:
             sys.stdout.write("\n")
