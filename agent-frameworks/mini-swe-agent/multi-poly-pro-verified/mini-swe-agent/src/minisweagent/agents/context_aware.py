@@ -118,6 +118,16 @@ def _bash_prints_file_content(bash: str) -> bool:
     return False
 
 
+def _is_final_submission_command(bash: str) -> bool:
+    """Final submit runs `git diff --cached`; that is patch output, not explore-context reading."""
+    return bool(
+        re.search(
+            r"\b(?:COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT|MINI_SWE_AGENT_FINAL_OUTPUT)\b",
+            bash,
+        )
+    )
+
+
 def _explore_violation_user_message(violation: int, limit: int) -> str:
     return (
         "ERROR: This action appears to print source code content, but EXPLORE_CONTEXT is "
@@ -274,7 +284,12 @@ class ContextAwareAgent(DefaultAgent):
             and _validate_explore_context_format(explore_context)
         )
         limit = int(getattr(self.config, "explore_context_retry_limit", 3) or 0)
-        requires = limit > 0 and _bash_prints_file_content(action["action"])
+        cmd = action.get("action", "")
+        requires = (
+            limit > 0
+            and not _is_final_submission_command(cmd)
+            and _bash_prints_file_content(cmd)
+        )
 
         if not requires or ec_valid:
             self._explore_context_violations = 0

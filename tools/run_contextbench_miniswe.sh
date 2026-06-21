@@ -14,13 +14,13 @@ Usage:
   --debug   Forward to contextbench.run: print agent subprocess cwd/cmd and live output (no capture).
 
 Examples:
-  tools/run_contextbench_miniswe.sh --bench Pro --output output_vllm/select_500_cwm --workers 12 --rerun true
-  tools/run_contextbench_miniswe.sh --bench Multi --output output_vllm/select_500_cwm --workers 8 --rerun false
-  tools/run_contextbench_miniswe.sh --bench Multi --output output_vllm/select_500_cwm --workers 8 --rerun true --instances "cli__cli-5047,sveltejs__svelte-10608"
-  tools/run_contextbench_miniswe.sh --bench Pro --output output_vllm/select_500_cwm --workers 1 --rerun false --debug
+  tools/run_contextbench_miniswe.sh --bench Pro --output output_vllm/select_500_qwen25_32B_instruct --workers 12 --rerun true
+  tools/run_contextbench_miniswe.sh --bench Multi --output output_vllm/select_500_qwen25_32B_instruct --workers 8 --rerun false
+  tools/run_contextbench_miniswe.sh --bench Multi --output output_vllm/select_500_qwen25_32B_instruct --workers 8 --rerun true --instances "cli__cli-5047,sveltejs__svelte-10608"
+  tools/run_contextbench_miniswe.sh --bench Pro --output output_vllm/select_500_qwen25_32B_instruct --workers 1 --rerun false --debug
 
   # 覆盖 vLLM 模型名（需与 start_vllm.sh 的 VLLM_MODEL / /v1/models 一致）:
-  export MINISWE_VLLM_MODEL=hosted_vllm/facebook/cwm
+  export MINISWE_VLLM_MODEL=hosted_vllm/Qwen/Qwen2.5-32B-Instruct
 EOF
 }
 
@@ -119,7 +119,11 @@ export MSWEA_POLY_GHCR_REGISTRY="ghcr.nju.edu.cn"
 unset MSWEA_GHCR_MIRROR
 
 # Hugging Face（HF_ENDPOINT 由 env_vllm_chat.sh 探测；强制镜像: export HF_ENDPOINT=https://hf-mirror.com）
-export HF_HOME="${HF_HOME:-/home/dataset-local/hf_cache}"
+if [[ -d /workspace/hf_cache ]]; then
+  export HF_HOME="${HF_HOME:-/workspace/hf_cache}"
+else
+  export HF_HOME="${HF_HOME:-/home/dataset-local/hf_cache}"
+fi
 export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-$HF_HOME/hub}"
 mkdir -p "$HUGGINGFACE_HUB_CACHE"
 
@@ -161,8 +165,8 @@ print('[run_contextbench_miniswe] preload ok:', '${dataset_id}')
 _preload_miniswe_hf_dataset
 
 # LiteLLM hosted_vllm/* 须与 tools/start_vllm.sh 当前服务的模型 ID 一致
-export MINISWE_VLLM_MODEL="${MINISWE_VLLM_MODEL:-hosted_vllm/facebook/cwm}"
-export VLLM_MODEL="${VLLM_MODEL:-facebook/cwm}"
+export MINISWE_VLLM_MODEL="${MINISWE_VLLM_MODEL:-hosted_vllm/Qwen/Qwen2.5-32B-Instruct}"
+export VLLM_MODEL="${VLLM_MODEL:-Qwen/Qwen2.5-32B-Instruct}"
 
 CMD=(
   python -m contextbench.run
