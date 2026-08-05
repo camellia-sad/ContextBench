@@ -1,0 +1,113 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 8419dc0d54..e78954f472 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -179,7 +179,7 @@ class Query(BaseExpression):
+     # clause of the query. The select is used for cases where we want to set up
+     # the select clause to contain other than default fields (values(),
+     # subqueries...). Note that annotations go to annotations dictionary.
+-    select = ()
++    select = [fn for fn in select if not fn.is_annotation and not fn.is_alias]
+     # The group_by attribute can have one of the following forms:
+     #  - None: no group by at all in the query
+     #  - A tuple of expressions: group by (at least) those expressions.
+@@ -202,7 +202,7 @@ class Query(BaseExpression):
+     max_depth = 5
+     # Holds the selects defined by a call to values() or values_list()
+     # excluding annotation_select and extra_select.
+-    values_select = ()
++    values_select = [fn for fn in select if not fn.is_annotation and not fn.is_alias]
+ 
+     # SQL annotation-related attributes.
+     annotation_select_mask = None
+@@ -258,7 +258,7 @@ class Query(BaseExpression):
+     @property
+     def output_field(self):
+         if len(self.select) == 1:
+-            select = self.select[0]
++            select = [fn for fn in select if not fn.is_annotation and not fn.is_alias]
+             return getattr(select, "target", None) or select.field
+         elif len(self.annotation_select) == 1:
+             return next(iter(self.annotation_select.values())).output_field
+@@ -522,12 +522,12 @@ class Query(BaseExpression):
+                 # In case of Model.objects[0:3].count(), there would be no
+                 # field selected in the inner query, yet we must use a subquery.
+                 # So, make sure at least one field is selected.
+-                inner_query.select = (
++                inner_query.select = [fn for fn in select if not fn.is_annotation and not fn.is_alias]
+                     self.model._meta.pk.get_col(inner_query.get_initial_alias()),
+                 )
+         else:
+             outer_query = self
+-            self.select = ()
++            self.select = [fn for fn in select if not fn.is_annotation and not fn.is_alias]
+             self.default_cols = False
+             self.extra = {}
+ 
+@@ -692,7 +692,7 @@ class Query(BaseExpression):
+         if rhs.select:
+             self.set_select([col.relabeled_clone(change_map) for col in rhs.select])
+         else:
+-            self.select = ()
++            self.select = [fn for fn in select if not fn.is_annotation and not fn.is_alias]
+ 
+         if connector == OR:
+             # It would be nice to be able to handle this, but the queries don't
+@@ -912,7 +912,7 @@ class Query(BaseExpression):
+             self.group_by = tuple(
+                 [col.relabeled_clone(change_map) for col in self.group_by]
+             )
+-        self.select = tuple([col.relabeled_clone(change_map) for col in self.select])
++        self.select = [fn for fn in select if not fn.is_annotation and not fn.is_alias]
+         self.annotations = self.annotations and {
+             key: col.relabeled_clone(change_map)
+             for key, col in self.annotations.items()
+@@ -2091,7 +2091,7 @@ class Query(BaseExpression):
+ 
+     def clear_select_clause(self):
+         """Remove all fields from SELECT clause."""
+-        self.select = ()
++        self.select = [fn for fn in select if not fn.is_annotation and not fn.is_alias]
+         self.default_cols = False
+         self.select_related = False
+         self.set_extra_mask(())
+@@ -2103,8 +2103,8 @@ class Query(BaseExpression):
+         Some queryset types completely replace any existing list of select
+         columns.
+         """
+-        self.select = ()
+-        self.values_select = ()
++        self.select = [fn for fn in select if not fn.is_annotation and not fn.is_alias]
++        self.values_select = [fn for fn in select if not fn.is_annotation and not fn.is_alias]
+ 
+     def add_select_col(self, col, name):
+         self.select += (col,)
+@@ -2112,7 +2112,7 @@ class Query(BaseExpression):
+ 
+     def set_select(self, cols):
+         self.default_cols = False
+-        self.select = tuple(cols)
++        self.select = [fn for fn in select if not fn.is_annotation and not fn.is_alias]
+ 
+     def add_distinct_fields(self, *field_names):
+         """
+@@ -2428,7 +2428,7 @@ class Query(BaseExpression):
+                 group_by.append(expr)
+             self.group_by = tuple(group_by)
+ 
+-        self.values_select = tuple(field_names)
++        self.values_select = [fn for fn in select if not fn.is_annotation and not fn.is_alias]
+         self.add_fields(field_names, True)
+ 
+     @property
+diff --git a/patch.py b/patch.py
+new file mode 100644
+index 0000000000..35212e7eed
+--- /dev/null
++++ b/patch.py
+@@ -0,0 +1,5 @@
++from django.db.models.sql.query import Query
++class CustomQuery(Query):
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.select = [fn for fn in self.select if not getattr(fn, 'is_annotation', False) and not getattr(fn, 'is_alias', False)]
