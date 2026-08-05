@@ -31,6 +31,40 @@ class LitellmModelConfig(BaseModel):
     """Cost tracking mode for this model. Can be "default" or "ignore_errors" (ignore errors/missing cost info)"""
 
 
+# Keys consumed locally; never forward to the OpenAI-compatible API.
+_LOCAL_MODEL_KWARG_KEYS = frozenset(
+    {
+        "auto_max_tokens",
+        "max_model_len",
+        "max_tokens_reserve",
+        "max_tokens_cap",
+    }
+)
+
+
+def _truthy(val: Any) -> bool:
+    if isinstance(val, bool):
+        return val
+    if val is None:
+        return False
+    return str(val).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _estimate_prompt_tokens(model_name: str, messages: list[dict[str, str]]) -> int:
+    try:
+        n = litellm.token_counter(model=model_name, messages=messages)
+        if isinstance(n, int) and n > 0:
+            return n
+    except Exception:
+        pass
+    # Fallback: rough char→token heuristic
+    chars = 0
+    for msg in messages:
+        content = msg.get("content") or ""
+        chars += len(content) if isinstance(content, str) else len(str(content))
+    return max(1, chars // 4)
+
+
 class LitellmModel:
     def __init__(self, *, config_class: Callable = LitellmModelConfig, **kwargs):
         self.config = config_class(**kwargs)
@@ -38,6 +72,82 @@ class LitellmModel:
         self.n_calls = 0
         if self.config.litellm_model_registry and Path(self.config.litellm_model_registry).is_file():
             litellm.utils.register_model(json.loads(Path(self.config.litellm_model_registry).read_text()))
+
+    def _prepare_completion_kwargs(self, messages: list[dict[str, str]], **kwargs) -> dict[str, Any]:
+        """Merge config/call kwargs; optionally set max_tokens from remaining context window."""
+        merged: dict[str, Any] = dict(self.config.model_kwargs) | dict(kwargs)
+
+        auto = merged.pop("auto_max_tokens", None)
+        max_model_len_cfg = merged.pop("max_model_len", None)
+        reserve_cfg = merged.pop("max_tokens_reserve", None)
+        cap_cfg = merged.pop("max_tokens_cap", None)
+        for k in list(merged.keys()):
+            if k in _LOCAL_MODEL_KWARG_KEYS:
+                merged.pop(k, None)
+
+        # Env fallbacks (useful with hosted_vllm / start_vllm.sh)
+        if auto is None:
+            auto = os.getenv("MSWEA_AUTO_MAX_TOKENS", "0")
+        if max_model_len_cfg is None:
+            max_model_len_cfg = os.getenv("MSWEA_MAX_MODEL_LEN") or os.getenv("VLLM_MAX_MODEL_LEN")
+        if reserve_cfg is None:
+            reserve_cfg = os.getenv("MSWEA_MAX_TOKENS_RESERVE", "0")
+        if cap_cfg is None:
+            cap_cfg = os.getenv("MSWEA_MAX_TOKENS_CAP")  # optional soft per-step cap
+
+        # Explicit max_tokens from caller/config wins unless auto is on and value is "auto"
+        existing = merged.get("max_tokens", None)
+        want_auto = _truthy(auto) or (
+            isinstance(existing, str) and existing.strip().lower() == "auto"
+        )
+        if existing is not None and not want_auto and not (
+            isinstance(existing, str) and existing.strip().lower() == "auto"
+        ):
+            return merged
+
+        if not want_auto:
+            return merged
+
+        try:
+            max_model_len = int(max_model_len_cfg) if max_model_len_cfg is not None else 131072
+        except (TypeError, ValueError):
+            max_model_len = 131072
+        try:
+            reserve = max(0, int(reserve_cfg))
+        except (TypeError, ValueError):
+            reserve = 0
+
+        prompt_tokens = _estimate_prompt_tokens(self.config.model_name, messages)
+        remaining = max_model_len - prompt_tokens - reserve
+        if remaining < 1:
+            raise litellm.exceptions.ContextWindowExceededError(
+                message=(
+                    f"Prompt too long for auto max_tokens: prompt≈{prompt_tokens}, "
+                    f"max_model_len={max_model_len}, reserve={reserve}"
+                ),
+                model=self.config.model_name,
+                llm_provider="hosted_vllm",
+            )
+
+        max_tokens = remaining
+        if cap_cfg is not None and str(cap_cfg).strip() != "":
+            try:
+                cap = int(cap_cfg)
+                if cap > 0:
+                    max_tokens = min(max_tokens, cap)
+            except (TypeError, ValueError):
+                pass
+
+        merged["max_tokens"] = int(max_tokens)
+        logger.info(
+            "auto_max_tokens: max_model_len=%s prompt≈%s reserve=%s -> max_tokens=%s%s",
+            max_model_len,
+            prompt_tokens,
+            reserve,
+            merged["max_tokens"],
+            f" (cap={cap_cfg})" if cap_cfg not in (None, "") else "",
+        )
+        return merged
 
     @retry(
         reraise=True,
@@ -58,8 +168,9 @@ class LitellmModel:
     )
     def _query(self, messages: list[dict[str, str]], **kwargs):
         try:
+            call_kwargs = self._prepare_completion_kwargs(messages, **kwargs)
             return litellm.completion(
-                model=self.config.model_name, messages=messages, **(self.config.model_kwargs | kwargs)
+                model=self.config.model_name, messages=messages, **call_kwargs
             )
         except litellm.exceptions.AuthenticationError as e:
             e.message += " You can permanently set your API key with `mini-extra config set KEY VALUE`."

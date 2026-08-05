@@ -5,34 +5,27 @@
 # 仅打印、不执行：bash tools/start_vllm.sh --print-cmd   或   -p
 #   只输出上述一行命令后立刻退出，**不会**安装依赖、**不会**启动 vLLM。
 #
-# 默认：facebook/cwm（原生 max_position_embeddings=131072，无需 YaRN）。
+# 默认模型：Qwen/Qwen3-8B（原生 pretrain 32k / config 40960；脚本默认 YaRN 扩到 131072）。
 #
-# CWM（门禁）示例（能直连 huggingface.co）：
+# ── 换模型时改哪里 ──────────────────────────────────────────────────────────
+# 1) 本文件「默认模型 + 模型 profile」区块（VLLM_MODEL 默认值与各 elif 分支）
+# 2) tools/run_contextbench_miniswe.sh 里的 MINISWE_VLLM_MODEL / VLLM_MODEL 默认值
+# 3) miniswe 输出目录名（-o output_vllm/...）避免覆盖旧结果
+# 4) 本地 checkpoint：export VLLM_MODEL=/容器内可见路径（勿用宿主机-only 路径）
+#
+# 各 profile 可调环境变量（export 后覆盖脚本默认）：
+#   VLLM_MODEL                  HF repo id 或本地路径
+#   VLLM_TP_SIZE                tensor parallel（131k + 32B 建议 2–4；8B 可用 1）
+#   VLLM_NATIVE_MAX_MODEL_LEN   YaRN 基准（Qwen3 官方文档用 32768，不是 config 的 40960）
+#   VLLM_MAX_MODEL_LEN          服务 context（> native 时自动 YaRN）
+#   VLLM_GPU_MEMORY_UTILIZATION gpu mem 占用比例
+#   VLLM_USE_CONCAT_CHAT_TEMPLATE  1=拼接 jinja；Qwen/Codestral 用 0
+#   VLLM_PRELOAD_HF_MODEL       1=启动前预下载；已有缓存可设 0
+#
+# CWM（门禁）：
 #   export VLLM_MODEL=facebook/cwm
-#   export VLLM_TP_SIZE=4
 #   export HF_TOKEN=hf_...
-#   export HF_ENDPOINT=https://huggingface.co
-#
-# CWM 离线（GPU 机无代理、不能连 huggingface.co）：
-#   在能上网的机器用 HF_TOKEN 下载后，把整个 hub 缓存目录拷到本机，例如：
-#     rsync -avz ~/.cache/huggingface/hub/models--facebook--cwm/  GPU机:$HF_HOME/hub/models--facebook--cwm/
-#   然后在 GPU 机：
-#     export VLLM_HF_OFFLINE=1
-#     export VLLM_PRELOAD_HF_MODEL=0
-#     export HF_HOME=/path/to/hf_cache
-#     bash tools/start_vllm.sh
-#   （hf-mirror 不能下 gated 的 cwm；勿指望镜像 + token）
-#
-# Codestral（YaRN 32768→131072）示例：
-#   export VLLM_MODEL=mistralai/Codestral-22B-v0.1
-#   export VLLM_TP_SIZE=1
-#   export VLLM_MAX_MODEL_LEN=131072
-#   export VLLM_NATIVE_MAX_MODEL_LEN=32768
-#
-# Qwen 等示例：
-#   export VLLM_MODEL=Qwen/Qwen2.5-Coder-7B
-#   export VLLM_TP_SIZE=1
-#   export VLLM_MAX_MODEL_LEN=32768
+# Codestral / Qwen2.5-32B / Qwen3-8B：见下方 profile，一般只需 export VLLM_MODEL=...
 
 set -euo pipefail
 
@@ -75,29 +68,78 @@ _TOOLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 # shellcheck source=/dev/null
 source "$_TOOLS_DIR/env_vllm_chat.sh"
 
+# Docker 容器内 HF 缓存（覆盖 env_vllm_chat.sh 的宿主机默认路径）
+if [[ -d /workspace/hf_cache ]]; then
+  export HF_HOME="${HF_HOME:-/workspace/hf_cache}"
+  export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-$HF_HOME/hub}"
+fi
+
 # FlashInfer 的 top-k/top-p 采样会在首次运行时调用 nvcc JIT；仅含 CUDA runtime 的镜像无 nvcc 会失败。
 # 使用 cuda devel / 已装 toolkit 且需要该路径时再 export VLLM_USE_FLASHINFER_SAMPLER=1。
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 
-VLLM_MODEL="${VLLM_MODEL:-Qwen/Qwen2.5-32B-Instruct}"
+# ── 默认模型 + 模型 profile（换模型：改默认值或增加 elif 分支）────────────────
+VLLM_MODEL="${VLLM_MODEL:-Qwen/Qwen3-8B}"
+
+_is_qwen25_32b_instruct() {
+  case "$VLLM_MODEL" in
+    Qwen/Qwen2.5-32B-Instruct | Qwen/Qwen2.5-32B-Instruct-* | hosted_vllm/Qwen/Qwen2.5-32B-Instruct)
+      return 0
+      ;;
+  esac
+  [[ "$VLLM_MODEL" == *Qwen2.5-32B-Instruct* ]]
+}
+
+_is_qwen3_8b() {
+  case "$VLLM_MODEL" in
+    Qwen/Qwen3-8B | Qwen/Qwen3-8B-* | hosted_vllm/Qwen/Qwen3-8B)
+      return 0
+      ;;
+  esac
+  [[ "$VLLM_MODEL" == *Qwen3-8B* ]]
+}
 
 if [[ "$VLLM_MODEL" == "facebook/cwm" ]]; then
+  # 原生 131072，无需 YaRN
   VLLM_TP_SIZE="${VLLM_TP_SIZE:-4}"
   VLLM_NATIVE_LEN="${VLLM_NATIVE_MAX_MODEL_LEN:-131072}"
   VLLM_MAX_LEN="${VLLM_MAX_MODEL_LEN:-131072}"
   VLLM_GPU_MEM="${VLLM_GPU_MEMORY_UTILIZATION:-0.8}"
   VLLM_PRELOAD_HF_MODEL="${VLLM_PRELOAD_HF_MODEL:-1}"
+  export VLLM_USE_CONCAT_CHAT_TEMPLATE="${VLLM_USE_CONCAT_CHAT_TEMPLATE:-1}"
 elif [[ "$VLLM_MODEL" == *Codestral* ]] || [[ "$VLLM_MODEL" == mistralai/Codestral* ]]; then
+  # mistralai/Codestral-22B-v0.1：原生 32768，默认 YaRN 扩到 131072
+  # 131k KV 较大：默认 TP=2（单卡可 export VLLM_TP_SIZE=1，但易 OOM）
+  VLLM_TP_SIZE="${VLLM_TP_SIZE:-2}"
+  VLLM_NATIVE_LEN="${VLLM_NATIVE_MAX_MODEL_LEN:-32768}"
+  VLLM_MAX_LEN="${VLLM_MAX_MODEL_LEN:-131072}"
+  VLLM_GPU_MEM="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
+  VLLM_PRELOAD_HF_MODEL="${VLLM_PRELOAD_HF_MODEL:-1}"
+  export VLLM_USE_CONCAT_CHAT_TEMPLATE="${VLLM_USE_CONCAT_CHAT_TEMPLATE:-0}"
+elif _is_qwen3_8b; then
+  # Qwen3-8B：官方 YaRN 基准 32768→131072（factor=4）；config.max_position_embeddings=40960 仅默认服务窗
   VLLM_TP_SIZE="${VLLM_TP_SIZE:-1}"
   VLLM_NATIVE_LEN="${VLLM_NATIVE_MAX_MODEL_LEN:-32768}"
   VLLM_MAX_LEN="${VLLM_MAX_MODEL_LEN:-131072}"
-  VLLM_GPU_MEM="${VLLM_GPU_MEMORY_UTILIZATION:-0.9}"
+  VLLM_GPU_MEM="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
   VLLM_PRELOAD_HF_MODEL="${VLLM_PRELOAD_HF_MODEL:-1}"
+  export VLLM_USE_CONCAT_CHAT_TEMPLATE="${VLLM_USE_CONCAT_CHAT_TEMPLATE:-0}"
+elif _is_qwen25_32b_instruct; then
+  # Qwen2.5-32B-Instruct：原生 32768，默认 YaRN 扩到 131072（ContextBench / miniswe 长 traj）
+  VLLM_TP_SIZE="${VLLM_TP_SIZE:-2}"
+  VLLM_NATIVE_LEN="${VLLM_NATIVE_MAX_MODEL_LEN:-32768}"
+  VLLM_MAX_LEN="${VLLM_MAX_MODEL_LEN:-131072}"
+  VLLM_GPU_MEM="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
+  VLLM_PRELOAD_HF_MODEL="${VLLM_PRELOAD_HF_MODEL:-1}"
+  export VLLM_USE_CONCAT_CHAT_TEMPLATE="${VLLM_USE_CONCAT_CHAT_TEMPLATE:-0}"
 else
+  # 其它 Qwen / Coder 等小模型：保持原生 32k
   VLLM_TP_SIZE="${VLLM_TP_SIZE:-1}"
   VLLM_NATIVE_LEN="${VLLM_NATIVE_MAX_MODEL_LEN:-32768}"
   VLLM_MAX_LEN="${VLLM_MAX_MODEL_LEN:-32768}"
   VLLM_GPU_MEM="${VLLM_GPU_MEMORY_UTILIZATION:-0.9}"
+  VLLM_PRELOAD_HF_MODEL="${VLLM_PRELOAD_HF_MODEL:-1}"
+  export VLLM_USE_CONCAT_CHAT_TEMPLATE="${VLLM_USE_CONCAT_CHAT_TEMPLATE:-0}"
 fi
 
 # facebook/cwm：门禁；hf-mirror 无法替代官网 token 下载
@@ -237,6 +279,9 @@ if [[ "${VLLM_USE_CONCAT_CHAT_TEMPLATE:-0}" == "1" ]]; then
   CHAT_ARGS=(--chat-template "$CHAT_TEMPLATE")
 fi
 
+# 注意：部分 vLLM 版本无 --chat-template-kwargs CLI。
+# Qwen3 thinking 默认在 miniswe yaml 的 model_kwargs.extra_body.chat_template_kwargs.enable_thinking=true 开启。
+
 # --hf-overrides：把 config 里的原生 context（如 32768）用 YaRN 等扩到 --max-model-len（如 131072）
 HF_OVERRIDE_ARGS=()
 if [[ -n "${VLLM_HF_OVERRIDES:-}" ]]; then
@@ -286,7 +331,7 @@ _print_copyable_cmd_line() {
   if [[ -n "${VLLM_HF_OVERRIDES:-}" ]]; then
     printf '%s' "; export VLLM_HF_OVERRIDES=$(printf '%q' "$VLLM_HF_OVERRIDES")"
   elif [[ "$VLLM_MAX_LEN" -gt "$VLLM_NATIVE_LEN" ]]; then
-    printf '%s' "; export VLLM_NATIVE_MAX_MODEL_LEN=${VLLM_NATIVE_LEN}"
+    printf '%s' "; export VLLM_NATIVE_MAX_MODEL_LEN=${VLLM_NATIVE_LEN}; export VLLM_MAX_MODEL_LEN=${VLLM_MAX_LEN}"
   fi
   if [[ -n "${HF_ENDPOINT:-}" ]]; then
     printf '%s' "; export HF_ENDPOINT=${HF_ENDPOINT}"

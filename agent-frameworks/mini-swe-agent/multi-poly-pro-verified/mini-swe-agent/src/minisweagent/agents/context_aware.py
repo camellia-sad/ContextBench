@@ -51,104 +51,6 @@ def _validate_explore_context_format(context: str) -> bool:
     return has_file and has_lines
 
 
-def _split_bash_segments(cmd: str) -> list[str]:
-    if not (cmd and cmd.strip()):
-        return []
-    out: list[str] = []
-    for part in re.split(r"\s*(?:&&|\|\|)\s*", cmd):
-        for seg in re.split(r"\s*;\s*", part):
-            s = seg.strip()
-            if s:
-                out.append(s)
-    return out
-
-
-def _bash_simple_command_reads_file(p: str) -> bool:
-    """Heuristic: this shell command fragment prints file / line content (needs EXPLORE_CONTEXT per system prompt)."""
-    p = p.strip()
-    if not p:
-        return False
-    if re.match(
-        r"^(ls|cd|export|find|echo|mkdir|rm|touch|which|true|false|printf|tee|mktemp)\s",
-        p,
-    ):
-        return False
-    if re.match(r"^(?:mv|cp|chmod|chown|install)\s", p):
-        return False
-    if re.match(r"^(?:grep|rg|egrep|fgrep)\b", p):
-        return False
-    if re.match(r"^python3?(?:\d+\.\d+)?\s", p) and re.search(
-        r"\.py(\s+|$)", p
-    ) and " -c" not in p:  # running a script, not a one-liner
-        return False
-    if re.search(r"\bcat\s*<<", p):
-        return False
-    if re.search(r"\bcat(?:\s+[>>]?>|\s*>)", p):
-        return False
-    if re.search(r"\bsed\b", p):
-        if re.search(r"(?:^|\s)-i[\d=.,\w-]*\s", p) or re.search(
-            r"(?:^|\s)-i$", p
-        ) or "--in-place" in p:
-            return False
-        return True
-    if re.search(r"\bcat\b", p):
-        return True
-    if re.search(r"\b(nl|head|tail|less|more|awk)\b", p):
-        return True
-    if re.search(r"\b(od|xxd|hexdump|strings)\b", p):
-        return True
-    if re.search(r"^git\s", p) and re.search(
-        r"^git\s+(show|diff|cat-file)\b", p
-    ):
-        return True
-    return False
-
-
-def _bash_segment_looks_like_file_reading(seg: str) -> bool:
-    for pipe in seg.split("|"):
-        if _bash_simple_command_reads_file(pipe):
-            return True
-    return False
-
-
-def _bash_prints_file_content(bash: str) -> bool:
-    for seg in _split_bash_segments(bash):
-        if _bash_segment_looks_like_file_reading(seg):
-            return True
-    return False
-
-
-def _is_final_submission_command(bash: str) -> bool:
-    """Final submit runs `git diff --cached`; that is patch output, not explore-context reading."""
-    return bool(
-        re.search(
-            r"\b(?:COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT|MINI_SWE_AGENT_FINAL_OUTPUT)\b",
-            bash,
-        )
-    )
-
-
-def _explore_violation_user_message(violation: int, limit: int) -> str:
-    return (
-        "ERROR: This action appears to print source code content, but EXPLORE_CONTEXT is "
-        "missing or malformed.\n"
-        "Do NOT run this read action until you provide a valid EXPLORE_CONTEXT block.\n\n"
-        "Use this exact response skeleton (fill all required fields):\n\n"
-        "<EXPLORE_CONTEXT>\n"
-        "File: /absolute/path/to/file.ext\n"
-        "Lines: <start>-<end>\n"
-        "</EXPLORE_CONTEXT>\n\n"
-        "```bash\n"
-        "<ONE_COMMAND_THAT_PRINTS_THE_DECLARED_LINES>\n"
-        "```\n\n"
-        "Required fields:\n"
-        "- File: absolute path only\n"
-        "- Lines: positive integer range where start <= end\n"
-        "- Command: must print the declared file/line content to stdout\n\n"
-        f"Consecutive violations: {violation}/{limit}."
-    )
-
-
 class ContextAwareAgentConfig(BaseModel):
     """Config for context-aware agent with additional templates."""
 
@@ -166,12 +68,6 @@ class ContextAwareAgentConfig(BaseModel):
     save_context_to_file: bool = True
     step_response_timeout: float = 0.0
     """Seconds for one LM step; 0 disables per-step timeout."""
-    explore_context_retry_limit: int = 3
-    """Consecutive read commands without valid EXPLORE_CONTEXT before ExploreContextEnforcementExceeded; 0 disables."""
-
-
-class ExploreContextEnforcementExceeded(TerminatingException):
-    """Too many file-reading commands without a valid EXPLORE_CONTEXT block."""
 
 
 class ContextRequested(Exception):
@@ -189,7 +85,6 @@ class ContextAwareAgent(DefaultAgent):
         super().__init__(*args, config_class=config_class, **kwargs)
         self.patch_context: str | None = None
         self.context_requested: bool = False
-        self._explore_context_violations: int = 0
 
     def add_message(self, role: str, content: str, **kwargs):
         """Extend supermethod to print messages."""
@@ -279,44 +174,9 @@ class ContextAwareAgent(DefaultAgent):
         action = self.parse_action(response)
         content = response.get("content", "")
         explore_context = _extract_explore_context_block(content)
-        ec_valid = (
-            explore_context is not None
-            and _validate_explore_context_format(explore_context)
-        )
-        limit = int(getattr(self.config, "explore_context_retry_limit", 3) or 0)
-        cmd = action.get("action", "")
-        requires = (
-            limit > 0
-            and not _is_final_submission_command(cmd)
-            and _bash_prints_file_content(cmd)
-        )
-
-        if not requires or ec_valid:
-            self._explore_context_violations = 0
-        if requires and not ec_valid:
-            self._explore_context_violations += 1
-            if self._explore_context_violations > limit:
-                raise ExploreContextEnforcementExceeded(
-                    f"Repeated read-file actions without valid EXPLORE_CONTEXT exceeded the retry limit ({limit}). "
-                    "Terminating this instance to avoid an infinite correction loop."
-                )
-            self.add_message(
-                "user",
-                _explore_violation_user_message(
-                    self._explore_context_violations, limit
-                ),
-            )
-            return {
-                "output": "",
-                "returncode": -1,
-                "action": action.get("action", ""),
-            }
-
-        output = self.execute_action(action)
-        if explore_context is not None and not _validate_explore_context_format(
-            explore_context
-        ):
+        if explore_context is not None and not _validate_explore_context_format(explore_context):
             explore_context = None
+        output = self.execute_action(action)
         observation = self.render_template(
             self.config.action_observation_template,  # type: ignore[arg-type]
             output=output,
@@ -361,7 +221,6 @@ class ContextAwareAgent(DefaultAgent):
         self.messages = []
         self.patch_context = None
         self.context_requested = False
-        self._explore_context_violations = 0
         self.add_message("system", self.render_template(self.config.system_template))
         self.add_message("user", self.render_template(self.config.instance_template))
 

@@ -528,7 +528,7 @@ def run_miniswe(task: Dict[str, Any], output_dir: Path, timeout: int = 1800) -> 
     miniswe_model = (
         os.environ.get("MINISWE_VLLM_MODEL")
         or os.environ.get("VLLM_MODEL")
-        or "hosted_vllm/Qwen/Qwen2.5-32B-Instruct"
+        or "hosted_vllm/Qwen/Qwen3-8B"
     )
     if miniswe_model and not miniswe_model.startswith("hosted_vllm/"):
         miniswe_model = f"hosted_vllm/{miniswe_model}"

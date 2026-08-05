@@ -1123,66 +1123,133 @@ def process_instance(
                 logger.warning(f"Error cleaning up environment for {instance_id}: {cleanup_error}")
 
 
+def _find_multiswe_local_snapshot(dataset_path: str) -> Path | None:
+    """Locate a local HF hub snapshot that contains Multi-SWE-bench jsonl files."""
+    repo_dir_name = "datasets--" + dataset_path.replace("/", "--")
+    candidate_roots: list[Path] = []
+
+    hub_cache = os.environ.get("HUGGINGFACE_HUB_CACHE")
+    if hub_cache:
+        candidate_roots.append(Path(hub_cache))
+
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        candidate_roots.append(Path(hf_home) / "hub")
+        candidate_roots.append(Path(hf_home))
+
+    # Common local caches on this machine / HF defaults
+    candidate_roots.extend(
+        [
+            Path("/home/dataset-local/hf_cache/hub"),
+            Path("/home/dataset-local/.hf_cache/hub"),
+            Path.home() / ".cache" / "huggingface" / "hub",
+        ]
+    )
+
+    seen: set[Path] = set()
+    for root in candidate_roots:
+        try:
+            root = root.resolve()
+        except OSError:
+            continue
+        if root in seen or not root.exists():
+            continue
+        seen.add(root)
+
+        snapshot_root = root / repo_dir_name / "snapshots"
+        if not snapshot_root.is_dir():
+            continue
+
+        # Prefer the newest snapshot directory
+        for snap in sorted(snapshot_root.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+            if snap.is_dir() and any(snap.rglob("*.jsonl")):
+                return snap
+    return None
+
+
+def _load_multiswe_from_local_jsonl(snapshot_dir: Path) -> list[dict]:
+    """Load Multi-SWE-bench rows from local jsonl files (avoids Arrow schema conflicts)."""
+    instances: list[dict] = []
+    jsonl_files = sorted(snapshot_dir.rglob("*.jsonl"))
+    logger.info(f"Loading Multi-SWE-bench from local snapshot: {snapshot_dir} ({len(jsonl_files)} jsonl files)")
+
+    for jsonl_path in jsonl_files:
+        with jsonl_path.open("r", encoding="utf-8") as fh:
+            for idx, line in enumerate(fh):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    raw = json.loads(line)
+                    instances.append(_simplify_multiswe_instance(raw))
+                except Exception as inst_error:
+                    logger.warning(f"Skipping problematic line {idx} in {jsonl_path.name}: {inst_error}")
+                    continue
+
+        if len(instances) and len(instances) % 100 == 0:
+            logger.info(f"Processed {len(instances)} instances...")
+
+    logger.info(f"Successfully loaded {len(instances)} Multi-SWE-bench instances via local jsonl")
+    return instances
+
+
 def _load_multiswe_dataset_safely(dataset_path: str, split: str) -> list[dict]:
-    """Safely load Multi-SWE-bench dataset with error handling for complex nested structures."""
+    """Safely load Multi-SWE-bench dataset with error handling for complex nested structures.
+
+    Prefer local HF hub jsonl snapshots: Multi-SWE nested test fields differ across repos,
+    so HuggingFace ``datasets`` Arrow casting often raises DatasetGenerationError.
+    """
+    # Priority 1: local jsonl (stable offline path)
+    local_snapshot = _find_multiswe_local_snapshot(dataset_path)
+    if local_snapshot is not None:
+        instances = _load_multiswe_from_local_jsonl(local_snapshot)
+        if instances:
+            return instances
+        logger.warning(f"Local Multi-SWE snapshot found but empty: {local_snapshot}")
+
+    # Priority 2: Hub load with retries (may still fail due to schema conflicts)
     max_retries = 3
-    
     for attempt in range(max_retries):
         try:
-            logger.info(f"Loading Multi-SWE-bench dataset (attempt {attempt + 1}/{max_retries})...")
-            
-            # Try to load dataset with streaming to reduce memory pressure
+            logger.info(f"Loading Multi-SWE-bench dataset from Hub (attempt {attempt + 1}/{max_retries})...")
+
             try:
-                # First try with streaming=True to avoid memory issues
                 dataset = load_dataset(dataset_path, split=split, streaming=True)
                 instances = []
-                
-                # Process instances one by one to handle complex structures
                 for idx, instance in enumerate(dataset):
                     try:
-                        # Simplify complex nested structures that cause PyArrow issues
-                        simplified_instance = _simplify_multiswe_instance(instance)
-                        instances.append(simplified_instance)
-                        
-                        # Log progress for large datasets
+                        instances.append(_simplify_multiswe_instance(instance))
                         if (idx + 1) % 100 == 0:
                             logger.info(f"Processed {idx + 1} instances...")
-                            
                     except Exception as inst_error:
                         logger.warning(f"Skipping problematic instance {idx}: {inst_error}")
                         continue
-                
                 logger.info(f"Successfully loaded {len(instances)} Multi-SWE-bench instances via streaming")
                 return instances
-                
             except Exception as streaming_error:
                 logger.warning(f"Streaming load failed: {streaming_error}")
-                
-                # Fallback: try regular loading with post-processing
                 logger.info("Attempting regular dataset loading with post-processing...")
                 dataset = load_dataset(dataset_path, split=split)
-                
-                # Convert to list and simplify structures
                 instances = []
                 for instance in dataset:
                     try:
-                        simplified_instance = _simplify_multiswe_instance(instance)
-                        instances.append(simplified_instance)
+                        instances.append(_simplify_multiswe_instance(instance))
                     except Exception as inst_error:
                         logger.warning(f"Skipping problematic instance: {inst_error}")
                         continue
-                
                 logger.info(f"Successfully loaded {len(instances)} Multi-SWE-bench instances via regular loading")
                 return instances
-                
+
         except Exception as e:
             logger.warning(f"Dataset loading attempt {attempt + 1} failed: {e}")
             if attempt < max_retries - 1:
-                logger.info(f"Retrying in 5 seconds...")
+                logger.info("Retrying in 5 seconds...")
                 time.sleep(5)
             else:
                 logger.error(f"Failed to load Multi-SWE-bench dataset after {max_retries} attempts")
-                raise RuntimeError(f"Cannot load dataset {dataset_path}: {e}")
+                raise RuntimeError(f"Cannot load dataset {dataset_path}: {e}") from e
+
+    raise RuntimeError(f"Cannot load dataset {dataset_path}: no instances found")
 
 
 def _simplify_multiswe_instance(instance: dict) -> dict:
